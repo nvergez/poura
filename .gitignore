@@ -28,3 +28,4 @@ DerivedData/
 *.apk
 *.so
 *.dex
+ble-explorer/.build/

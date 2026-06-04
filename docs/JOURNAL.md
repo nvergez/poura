@@ -151,3 +151,35 @@ In which state does the ring accept a NEW `SetAuthKey`?
   the state required for SetAuthKey), and validate that no server step is blocking.
 - Priority shifts to: (1) understand the onboarding/takeover sequence via btsnoop
   capture, (2) code the BLE explorer to reproduce SetAuthKey+Authenticate.
+
+---
+
+## 2026-06-04 — Field observation (user) + decision to code the BLE explorer
+
+### User's real-world experience with the physical ring
+User switched iPhones a while ago WITHOUT resetting anything. On the new iPhone,
+the Oura app treated the ring like a "new ring" to onboard. By simply **placing the
+ring on its charger**, it appeared in the Oura app and connected immediately,
+no issue. → Strong hint that **the charger opens an onboarding/pairing window**
+(common anti-theft guard on wearables).
+
+### Two competing hypotheses (cannot decide by reasoning)
+- **H1 — true takeover**: the ring accepted a NEW auth_key from the new iPhone
+  (charger = window to accept SetAuthKey). → ideal for us.
+- **H2 — cloud re-sync**: the Oura account re-synced the EXISTING auth_key to the
+  new iPhone (the JSON `auth_key` field exists precisely for cross-device sync),
+  and the ring just re-authenticated with the SAME key. Charger only eased the
+  reconnection, didn't authorize a new key.
+
+Deciding H1 vs H2 requires observing the real ring. This is what the BLE explorer
++ a capture will tell us.
+
+### Decision
+Code the **macOS BLE explorer** now (read-only first: scan, connect, dump GATT,
+read battery/firmware). Reasons: enough theory; the next unknowns (H1/H2, ring
+state, real service presence) only resolve by observing the actual ring; zero risk
+(no writes until fully mapped); runs on the Mac (CoreBluetooth); it's the
+foundation of the final iOS app.
+
+In parallel (background): static analysis of whether ResetMemory (0x1A) requires
+prior auth — to know if a pure-BLE takeover (no physical reset) is possible.
