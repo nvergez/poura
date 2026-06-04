@@ -17,6 +17,10 @@
 import Foundation
 import CoreBluetooth
 
+// Force line-buffered / immediate flush so output is visible even when stdout is
+// redirected to a file (otherwise libc block-buffers and we see nothing live).
+setbuf(stdout, nil)
+
 // Known Oura Ring 4 GATT identifiers (from research — to be VALIDATED against the
 // real ring; see docs/PROTOCOL.md). The primary custom service:
 let ouraServiceUUID = CBUUID(string: "98ed0001-a541-11e4-b6a0-0002a5d5c51b")
@@ -141,8 +145,8 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 connect(p)
                 return
             }
-            log("[ble] Peripheral \(uuid) not cached; scanning to find it…")
-            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+            log("[ble] Peripheral \(uuid) not cached; scanning to find it (waiting for a strong-enough advert)…")
+            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         case .ouraOnly:
             log("[ble] Scanning for Oura service \(ouraServiceUUID.uuidString)…")
             // Scan with the service filter; some peripherals only advertise the
@@ -192,6 +196,9 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             mfg = hex(m)
         }
 
+        let connectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue
+        let connStr = connectable == nil ? "?" : (connectable! ? "YES" : "NO")
+
         switch mode {
         case .scanAll:
             // Live print ONLY for newly-seen devices (avoid the duplicate spam),
@@ -199,8 +206,8 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let ringLike = advName.lowercased().contains("oura")
                 || (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) == true
             if ringLike {
-                log(String(format: "[scan] ⟵RING? %@  rssi=%-4d  %@  svc=[%@]  mfg=[%@]",
-                           peripheral.identifier.uuidString, RSSI.intValue, advName, svcs, mfg))
+                log(String(format: "[scan] ⟵RING? %@  rssi=%-4d  %@  svc=[%@]  mfg=[%@]  connectable=%@",
+                           peripheral.identifier.uuidString, RSSI.intValue, advName, svcs, mfg, connStr))
             } else if isNew {
                 log(String(format: "[scan] %@  rssi=%-4d  %@  svc=[%@]%@",
                            peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
@@ -227,15 +234,29 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
+    var connecting = false
     func connect(_ peripheral: CBPeripheral) {
+        guard !connecting else { return }
+        connecting = true
+        central.stopScan()
         target = peripheral
         peripheral.delegate = self
-        log("[ble] Connecting to \(peripheral.identifier.uuidString)…")
+        log("[ble] Connecting to \(peripheral.identifier.uuidString) (\(peripheral.name ?? "?"))…")
         central.connect(peripheral, options: nil)
+        // Connection watchdog: if not connected in 15s, log it (the ring may be
+        // weak-signal on the charger — move it closer to the Mac).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self else { return }
+            if self.target?.state != .connected {
+                self.log("[ble] Still not connected after 15s (state=\(self.target?.state.rawValue ?? -1)). Weak signal? Move the ring/charger closer to the Mac. Retrying scan…")
+                self.central.connect(peripheral, options: nil)
+            }
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        log("[ble] Connected. Name=\(peripheral.name ?? "(nil)"). Discovering services…")
+        connecting = true
+        log("[ble] ✅ Connected. Name=\(peripheral.name ?? "(nil)"). Discovering services…")
         peripheral.discoverServices(nil) // discover ALL services
     }
 
