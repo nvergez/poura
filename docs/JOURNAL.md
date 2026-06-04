@@ -243,3 +243,22 @@ a real challenge-response. We can re-authenticate at will, no pairing mode, no O
 ### Modes now in the explorer
 --oura (scan+connect), --connect <uuid>, --name <s>, --takeover (set our key),
 --auth <hexkey> (authenticate with saved key), --selftest (AES KAT), default scan.
+
+---
+
+## 2026-06-04 — Key secured (Keychain) + in-app reset coded
+
+- **Keychain**: `--store-key <hex>` migrates the auth_key into the macOS Keychain
+  (encrypted at rest). `--takeover` now auto-stores on success. `--auth`/`--reset`
+  load from Keychain when no key is passed. Verified: `--auth` (no arg) loaded the
+  key from Keychain and authenticated (fresh nonce, 0x00). Plaintext
+  secrets/ring-auth-key.txt kept as a manual backup (git-ignored) — user to also
+  back up the key in a personal password manager.
+- **--reset** mode coded (NOT run, to keep our takeover): authenticates with our
+  key, then sends ResetMemory `[0x1A 0x00]` (mirrors the captured app reset). Lets
+  us hand the ring back to Oura cleanly. Note: needs the current key (anti-theft);
+  the physical charger-tap reset is the fallback if the key is lost.
+
+### Explorer command surface (final for this phase)
+--oura · --connect <uuid> · --name <s> · --takeover · --auth [hex] · --reset [hex]
+· --store-key <hex> · --selftest · (default) scan-all

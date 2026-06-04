@@ -38,7 +38,9 @@ enum Mode {
     case connect(uuid: UUID)
     case byName(substring: String)
     case takeover         // scan ring (pairing mode) → bond → SetAuthKey(ours) → Authenticate
-    case auth(key: Data)  // reconnect (no pairing mode) → GetAuthNonce → Authenticate with our saved key
+    case auth(key: Data)  // reconnect → GetAuthNonce → Authenticate with our saved key
+    case reset(key: Data) // authenticate with our key, then ResetMemory (give the ring back)
+    case storeKey(key: Data) // migrate a key into the macOS Keychain, no BLE
     case selftest         // validate AES-128-ECB against a known FIPS-197 vector, no BLE
 }
 
@@ -67,10 +69,29 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
         case "--takeover":
             mode = .takeover
         case "--auth":
+            // Key from arg, else from Keychain.
             if i + 1 < args.count, let k = hexToData(args[i + 1]) {
                 mode = .auth(key: k); i += 1
+            } else if let k = Keychain.loadAuthKey() {
+                mode = .auth(key: k)
             } else {
-                FileHandle.standardError.write(Data("--auth requires a 32-hex-char (16-byte) key\n".utf8))
+                FileHandle.standardError.write(Data("--auth: provide a 32-hex key or store one first (--store-key)\n".utf8))
+                exit(2)
+            }
+        case "--reset":
+            if i + 1 < args.count, let k = hexToData(args[i + 1]) {
+                mode = .reset(key: k); i += 1
+            } else if let k = Keychain.loadAuthKey() {
+                mode = .reset(key: k)
+            } else {
+                FileHandle.standardError.write(Data("--reset: provide a 32-hex key or store one first (--store-key)\n".utf8))
+                exit(2)
+            }
+        case "--store-key":
+            if i + 1 < args.count, let k = hexToData(args[i + 1]) {
+                mode = .storeKey(key: k); i += 1
+            } else {
+                FileHandle.standardError.write(Data("--store-key requires a 32-hex-char (16-byte) key\n".utf8))
                 exit(2)
             }
         case "--selftest":
@@ -183,13 +204,16 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             log("[ble] Peripheral \(uuid) not cached; scanning to find it (waiting for a strong-enough advert)…")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        case .ouraOnly, .takeover, .auth:
+        case .ouraOnly, .takeover, .auth, .reset:
             if case .takeover = mode {
                 log("[takeover] ⚠️ This will SET OUR OWN auth_key on the ring. Only run on a FACTORY-RESET ring.")
                 log("[takeover] Put the ring in PAIRING MODE: remove from charger and put it back (white blinking light).")
             }
             if case .auth = mode {
-                log("[auth] Persistence test: reconnect (no pairing mode needed) → authenticate with our saved key.")
+                log("[auth] Persistence test: reconnect → authenticate with our saved key.")
+            }
+            if case .reset = mode {
+                log("[reset] ⚠️ This will AUTHENTICATE then FACTORY-RESET the ring (give it back). Data on the ring is erased.")
             }
             log("[ble] Scanning for Oura service \(ouraServiceUUID.uuidString)…")
             central.scanForPeripherals(withServices: [ouraServiceUUID], options: nil)
@@ -199,7 +223,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 self.central.stopScan()
                 self.central.scanForPeripherals(withServices: nil, options: nil)
             }
-        case .selftest:
+        case .selftest, .storeKey:
             break // handled before BLE starts
         case .byName, .scanAll:
             log("[ble] Scanning all peripherals for \(Int(scanSeconds))s…")
@@ -255,14 +279,14 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                            peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
                            mfg.isEmpty ? "" : "  mfg=[\(mfg)]"))
             }
-        case .ouraOnly, .takeover, .auth:
+        case .ouraOnly, .takeover, .auth, .reset:
             let advertisesOura = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) ?? false
             if advertisesOura || advName.lowercased().contains("oura") {
                 log("[ble] Found candidate Oura device: \(advName) [\(peripheral.identifier.uuidString)] rssi=\(RSSI.intValue) connectable=\(connStr)")
                 central.stopScan()
                 connect(peripheral)
             }
-        case .selftest:
+        case .selftest, .storeKey:
             break
         case .byName(let sub):
             if advName.lowercased().contains(sub.lowercased()) {
@@ -358,7 +382,9 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     var isTakeover: Bool { if case .takeover = mode { return true } else { return false } }
     var isAuthOnly: Bool { if case .auth = mode { return true } else { return false } }
-    var isHandshake: Bool { isTakeover || isAuthOnly }
+    var isReset: Bool { if case .reset = mode { return true } else { return false } }
+    var isHandshake: Bool { isTakeover || isAuthOnly || isReset }
+    var handshakeTag: String { isTakeover ? "takeover" : (isReset ? "reset" : "auth") }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard isHandshake, characteristic == notifyChar else { return }
@@ -367,11 +393,14 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard takeoverStep == .idle else { return }
         takeoverStep = .notifyEnabled
 
-        if case .auth(let key) = mode {
-            // Persistence test: skip SetAuthKey, authenticate with the saved key.
+        // auth & reset: authenticate first with the saved key (skip SetAuthKey).
+        var savedKey: Data? = nil
+        if case .auth(let k) = mode { savedKey = k }
+        if case .reset(let k) = mode { savedKey = k }
+        if let key = savedKey {
             myAuthKey = key
-            log("[auth] Notifications enabled. Authenticating with saved key \(hex(myAuthKey))")
-            log("[auth] → GetAuthNonce (2F 01 2B)…")
+            log("[\(tag)] Notifications enabled. Authenticating with saved key \(hex(myAuthKey))")
+            log("[\(tag)] → GetAuthNonce (2F 01 2B)…")
             takeoverStep = .sentNonce
             write(OuraProtocol.getAuthNonce())
         } else {
@@ -423,42 +452,67 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         case "nonce":
             let nonce = parsed.payload
             guard nonce.count == 15 else {
-                log("[takeover] ❌ Unexpected nonce length \(nonce.count) (expected 15). Stopping."); finishTakeover(peripheral, success: false); return
+                log("[\(handshakeTag)] ❌ Unexpected nonce length \(nonce.count) (expected 15). Stopping."); finishTakeover(peripheral, success: false); return
             }
             guard let proof = OuraProtocol.computeProof(authKey: myAuthKey, nonce15: nonce) else {
-                log("[takeover] ❌ Proof computation failed."); finishTakeover(peripheral, success: false); return
+                log("[\(handshakeTag)] ❌ Proof computation failed."); finishTakeover(peripheral, success: false); return
             }
-            log("[takeover] nonce=\(hex(nonce)) → proof=\(hex(proof)). → Authenticate…")
+            log("[\(handshakeTag)] nonce=\(hex(nonce)) → proof=\(hex(proof)). → Authenticate…")
             takeoverStep = .sentAuth
             write(OuraProtocol.authenticate(proof: proof))
         case "auth":
             let code = parsed.payload.first ?? 0xFF
             if code == 0x00 {
-                log("[takeover] 🎉🎉 AUTHENTICATED with OUR key! The ring is now ours. (code=0x00)")
-                finishTakeover(peripheral, success: true)
+                log("[\(handshakeTag)] 🎉 AUTHENTICATED with OUR key (code=0x00).")
+                if isReset {
+                    // Now give the ring back: ResetMemory.
+                    log("[reset] → ResetMemory (factory reset, [0x1A 0x00])…")
+                    takeoverStep = .done   // reuse; we wait for the reset response below via a fresh step guard
+                    resetSent = true
+                    write(Data([OuraOpcode.resetMemory, 0x00]))   // matches the app's ResetMemory(false)
+                    // Some firmwares reset without replying; exit after a short grace.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                        guard let self else { return }
+                        self.log("[reset] ✅ ResetMemory sent. Ring should now be factory-reset (leave it still ~2 min).")
+                        self.central.cancelPeripheralConnection(peripheral)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+                    }
+                } else {
+                    finishTakeover(peripheral, success: true)
+                }
             } else {
                 let meaning = ["0x01":"auth error", "0x02":"in factory reset", "0x03":"not original onboarded device"]["0x\(String(format: "%02x", code))"] ?? "unknown"
-                log("[takeover] ❌ Authenticate failed (code=0x\(String(format: "%02x", code)) = \(meaning)).")
+                log("[\(handshakeTag)] ❌ Authenticate failed (code=0x\(String(format: "%02x", code)) = \(meaning)).")
                 finishTakeover(peripheral, success: false)
             }
+        case "raw":
+            // In reset mode, a 1b… response is the ResetMemory ack.
+            if isReset, resetSent, parsed.payload.first == 0x1B {
+                log("[reset] ✅ ResetMemory acknowledged: \(hex(parsed.payload))")
+            }
         default:
-            break // ignore other notifications during takeover
+            break
         }
     }
+    var resetSent = false
 
     func finishTakeover(_ peripheral: CBPeripheral, success: Bool) {
         guard takeoverStep != .done else { return }
         takeoverStep = .done
-        let tag = isTakeover ? "takeover" : "auth"
         if success {
             if isAuthOnly {
                 log("\n[auth] ✅ PERSISTENCE CONFIRMED — the ring remembered our key. We can re-authenticate anytime.")
-            } else {
-                log("\n[takeover] ✅ SUCCESS. Save THIS key to talk to the ring from now on:")
-                log("[takeover]   AUTH_KEY=\(hex(myAuthKey).replacingOccurrences(of: " ", with: ""))")
+            } else if isTakeover {
+                let hexKey = hex(myAuthKey).replacingOccurrences(of: " ", with: "")
+                if Keychain.storeAuthKey(myAuthKey) {
+                    log("\n[takeover] ✅ SUCCESS. Key stored in macOS Keychain. (also shown below)")
+                } else {
+                    log("\n[takeover] ✅ SUCCESS (⚠️ failed to store in Keychain — save it manually).")
+                }
+                log("[takeover]   AUTH_KEY=\(hexKey)")
             }
         } else {
-            log("\n[\(tag)] ✗ Did not complete. See messages above.")
+            log("\n[\(handshakeTag)] ✗ Did not complete. See messages above.")
         }
         central.cancelPeripheralConnection(peripheral)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(success ? 0 : 1) }
@@ -489,6 +543,18 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 }
 
 let (mode, scanSeconds) = parseArgs()
+
+// Store-key: migrate the auth key into the macOS Keychain (no BLE).
+if case .storeKey(let key) = mode {
+    if Keychain.storeAuthKey(key) {
+        print("[keychain] ✅ auth_key stored in macOS Keychain (service=\(Keychain.service)).")
+        print("[keychain] You can now run --auth / --reset without passing the key.")
+        print("[keychain] Reminder: also delete the plaintext secrets/ring-auth-key.txt if you want.")
+        exit(0)
+    } else {
+        print("[keychain] ❌ Failed to store key."); exit(1)
+    }
+}
 
 // Self-test: validate AES-128-ECB against the FIPS-197 known-answer vector BEFORE
 // trusting it on real hardware. No Bluetooth involved.
