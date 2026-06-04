@@ -183,12 +183,29 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         advertisementData: [String : Any], rssi RSSI: NSNumber) {
         let advName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? "(unknown)"
         let svcs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.map { $0.uuidString }.joined(separator: ",") ?? ""
+        let isNew = discovered[peripheral.identifier] == nil
         discovered[peripheral.identifier] = (peripheral, advName, RSSI.intValue)
+
+        // Manufacturer data is gold for fingerprinting the ring (Oura company ID, etc.)
+        var mfg = ""
+        if let m = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data {
+            mfg = hex(m)
+        }
 
         switch mode {
         case .scanAll:
-            // Live print as we discover.
-            log(String(format: "[scan] %@  rssi=%-4d  %@  svc=[%@]", peripheral.identifier.uuidString, RSSI.intValue, advName, svcs))
+            // Live print ONLY for newly-seen devices (avoid the duplicate spam),
+            // and always print devices that look ring-like or carry mfg data.
+            let ringLike = advName.lowercased().contains("oura")
+                || (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) == true
+            if ringLike {
+                log(String(format: "[scan] ⟵RING? %@  rssi=%-4d  %@  svc=[%@]  mfg=[%@]",
+                           peripheral.identifier.uuidString, RSSI.intValue, advName, svcs, mfg))
+            } else if isNew {
+                log(String(format: "[scan] %@  rssi=%-4d  %@  svc=[%@]%@",
+                           peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
+                           mfg.isEmpty ? "" : "  mfg=[\(mfg)]"))
+            }
         case .ouraOnly:
             let advertisesOura = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) ?? false
             if advertisesOura || advName.lowercased().contains("oura") {
