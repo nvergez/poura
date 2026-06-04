@@ -1,0 +1,30 @@
+# Captures BLE / logs bruts — peuvent contenir des données santé + clés. NE PAS committer.
+captures/*
+!captures/.gitkeep
+*.btsnoop
+*.pcap
+*.pcapng
+*.cfa
+
+# Secrets extraits (auth_key, bonds, DBs de l'app Oura) — JAMAIS dans git
+*.realm
+*.sqlite
+secrets/
+*.key
+auth_key*
+
+# Xcode / Swift
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.build/
+.swiftpm/
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+
+# APK / outils RE (volumineux, redistribution firmware Oura à éviter)
+*.apk
+*.so
+*.dex
