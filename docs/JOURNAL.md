@@ -224,3 +224,22 @@ Fixed by matching exact UUIDs. Lesson: target Oura chars by UUID, not properties
 - Read real data: enable notifications + GetEvent (0x10) / battery (0x0C) /
   product info (0x18) / live stream. Decode TLV records (PPG/IBI/accel/temp).
 - Port this to the iOS app (ios-app/), reusing OuraProtocol.swift.
+
+---
+
+## 2026-06-04 — ✅ Key persistence CONFIRMED (--auth mode)
+
+Reconnected WITHOUT re-sending SetAuthKey — only the handshake (GetAuthNonce →
+Authenticate with our saved key) → ring returned 0x00. The ring durably stored
+our key. Fresh nonce each time (09 12 63 b0… vs a5 2d 80 8d… at takeover) proves
+a real challenge-response. We can re-authenticate at will, no pairing mode, no Oura.
+
+### Safety net for key loss (researched, NOT tested to avoid losing our takeover)
+- Physical factory reset exists: ring on powered charger, tap charger on a hard
+  surface ~5-10×; some models have a side button. (Community sources — to confirm
+  on Ring 4.) → losing the key is recoverable via physical reset, ring not bricked.
+- App factory reset = ResetMemory after auth (anti-theft: needs the current key).
+
+### Modes now in the explorer
+--oura (scan+connect), --connect <uuid>, --name <s>, --takeover (set our key),
+--auth <hexkey> (authenticate with saved key), --selftest (AES KAT), default scan.

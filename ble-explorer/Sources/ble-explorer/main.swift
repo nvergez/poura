@@ -38,7 +38,21 @@ enum Mode {
     case connect(uuid: UUID)
     case byName(substring: String)
     case takeover         // scan ring (pairing mode) → bond → SetAuthKey(ours) → Authenticate
+    case auth(key: Data)  // reconnect (no pairing mode) → GetAuthNonce → Authenticate with our saved key
     case selftest         // validate AES-128-ECB against a known FIPS-197 vector, no BLE
+}
+
+/// Parse a 32-hex-char string into 16 bytes.
+func hexToData(_ s: String) -> Data? {
+    let clean = s.filter { $0.isHexDigit }
+    guard clean.count == 32 else { return nil }
+    var d = Data(); var idx = clean.startIndex
+    while idx < clean.endIndex {
+        let next = clean.index(idx, offsetBy: 2)
+        guard let b = UInt8(clean[idx..<next], radix: 16) else { return nil }
+        d.append(b); idx = next
+    }
+    return d
 }
 
 func parseArgs() -> (mode: Mode, scanSeconds: Double) {
@@ -52,6 +66,13 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
             mode = .ouraOnly
         case "--takeover":
             mode = .takeover
+        case "--auth":
+            if i + 1 < args.count, let k = hexToData(args[i + 1]) {
+                mode = .auth(key: k); i += 1
+            } else {
+                FileHandle.standardError.write(Data("--auth requires a 32-hex-char (16-byte) key\n".utf8))
+                exit(2)
+            }
         case "--selftest":
             mode = .selftest
         case "--connect":
@@ -162,10 +183,13 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             log("[ble] Peripheral \(uuid) not cached; scanning to find it (waiting for a strong-enough advert)…")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        case .ouraOnly, .takeover:
+        case .ouraOnly, .takeover, .auth:
             if case .takeover = mode {
                 log("[takeover] ⚠️ This will SET OUR OWN auth_key on the ring. Only run on a FACTORY-RESET ring.")
                 log("[takeover] Put the ring in PAIRING MODE: remove from charger and put it back (white blinking light).")
+            }
+            if case .auth = mode {
+                log("[auth] Persistence test: reconnect (no pairing mode needed) → authenticate with our saved key.")
             }
             log("[ble] Scanning for Oura service \(ouraServiceUUID.uuidString)…")
             central.scanForPeripherals(withServices: [ouraServiceUUID], options: nil)
@@ -231,7 +255,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                            peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
                            mfg.isEmpty ? "" : "  mfg=[\(mfg)]"))
             }
-        case .ouraOnly, .takeover:
+        case .ouraOnly, .takeover, .auth:
             let advertisesOura = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) ?? false
             if advertisesOura || advName.lowercased().contains("oura") {
                 log("[ble] Found candidate Oura device: \(advName) [\(peripheral.identifier.uuidString)] rssi=\(RSSI.intValue) connectable=\(connStr)")
@@ -309,42 +333,53 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let marker = c.uuid == ouraNotifyCharUUID ? "  ⟵ OURA NOTIFY" : ""
             log("    └ char \(c.uuid.uuidString)  props=[\(describeProperties(c.properties))]\(marker)")
 
-            // In takeover mode, capture the EXACT Oura write + notify characteristics
-            // by UUID (confirmed from capture). Heuristics on properties pick the
-            // wrong char (98ED0004 also has write+notify) — match UUIDs explicitly.
-            if case .takeover = mode, service.uuid == ouraServiceUUID {
+            // In takeover/auth mode, capture the EXACT Oura write + notify chars by
+            // UUID (98ED0004 also has write+notify — match UUIDs explicitly).
+            if isHandshake, service.uuid == ouraServiceUUID {
                 if c.uuid == ouraNotifyCharUUID { notifyChar = c }
                 if c.uuid == ouraWriteCharUUID { writeChar = c }
             }
 
-            // Read any readable characteristic (read-only behavior) — NOT in takeover.
-            if c.properties.contains(.read), !isTakeover {
+            // Read any readable characteristic (read-only) — NOT during a handshake.
+            if c.properties.contains(.read), !isHandshake {
                 pendingReads += 1
                 peripheral.readValue(for: c)
             }
             peripheral.discoverDescriptors(for: c)
         }
 
-        if isTakeover, let nc = notifyChar, writeChar != nil, takeoverStep == .idle {
-            log("[takeover] Found Oura write + notify chars. Enabling notifications…")
+        if isHandshake, let nc = notifyChar, writeChar != nil, takeoverStep == .idle {
+            log("[\(isTakeover ? "takeover" : "auth")] Found Oura write + notify chars. Enabling notifications…")
             peripheral.setNotifyValue(true, for: nc)
-            // Handshake proceeds in didUpdateNotificationStateFor.
-        } else if !isTakeover {
+        } else if !isHandshake {
             checkDone(peripheral)
         }
     }
 
     var isTakeover: Bool { if case .takeover = mode { return true } else { return false } }
+    var isAuthOnly: Bool { if case .auth = mode { return true } else { return false } }
+    var isHandshake: Bool { isTakeover || isAuthOnly }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        guard isTakeover, characteristic == notifyChar else { return }
-        if let error { log("[takeover] Failed to enable notifications: \(error.localizedDescription)"); exit(1) }
+        guard isHandshake, characteristic == notifyChar else { return }
+        let tag = isTakeover ? "takeover" : "auth"
+        if let error { log("[\(tag)] Failed to enable notifications: \(error.localizedDescription)"); exit(1) }
         guard takeoverStep == .idle else { return }
         takeoverStep = .notifyEnabled
-        log("[takeover] Notifications enabled. My auth_key = \(hex(myAuthKey))")
-        log("[takeover] → SetAuthKey (0x24)…")
-        takeoverStep = .sentSetAuthKey
-        write(OuraProtocol.setAuthKey(myAuthKey))
+
+        if case .auth(let key) = mode {
+            // Persistence test: skip SetAuthKey, authenticate with the saved key.
+            myAuthKey = key
+            log("[auth] Notifications enabled. Authenticating with saved key \(hex(myAuthKey))")
+            log("[auth] → GetAuthNonce (2F 01 2B)…")
+            takeoverStep = .sentNonce
+            write(OuraProtocol.getAuthNonce())
+        } else {
+            log("[takeover] Notifications enabled. My auth_key = \(hex(myAuthKey))")
+            log("[takeover] → SetAuthKey (0x24)…")
+            takeoverStep = .sentSetAuthKey
+            write(OuraProtocol.setAuthKey(myAuthKey))
+        }
     }
 
     func write(_ data: Data) {
@@ -356,8 +391,8 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        // Takeover: drive the auth handshake from notify responses.
-        if isTakeover, characteristic == notifyChar {
+        // Takeover/auth: drive the handshake from notify responses.
+        if isHandshake, characteristic == notifyChar {
             guard let data = characteristic.value else { return }
             let parsed = OuraProtocol.parseNotification(data)
             log("[takeover]   notify: \(hex(data))  → \(parsed.kind)")
@@ -414,11 +449,16 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func finishTakeover(_ peripheral: CBPeripheral, success: Bool) {
         guard takeoverStep != .done else { return }
         takeoverStep = .done
+        let tag = isTakeover ? "takeover" : "auth"
         if success {
-            log("\n[takeover] ✅ SUCCESS. Save THIS key to talk to the ring from now on:")
-            log("[takeover]   AUTH_KEY=\(hex(myAuthKey).replacingOccurrences(of: " ", with: ""))")
+            if isAuthOnly {
+                log("\n[auth] ✅ PERSISTENCE CONFIRMED — the ring remembered our key. We can re-authenticate anytime.")
+            } else {
+                log("\n[takeover] ✅ SUCCESS. Save THIS key to talk to the ring from now on:")
+                log("[takeover]   AUTH_KEY=\(hex(myAuthKey).replacingOccurrences(of: " ", with: ""))")
+            }
         } else {
-            log("\n[takeover] ✗ Takeover did not complete. See messages above.")
+            log("\n[\(tag)] ✗ Did not complete. See messages above.")
         }
         central.cancelPeripheralConnection(peripheral)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(success ? 0 : 1) }
