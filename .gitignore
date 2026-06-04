@@ -31,10 +31,8 @@ DerivedData/
 ble-explorer/.build/
 captures/*bugreport*
 
-# Decompiled/disassembled Oura app = Oura's PROPRIETARY copyrighted code.
-# NEVER commit or redistribute (RE is done locally for interop only).
+# Local-only RE artifacts and large/generated outputs — keep out of the repo.
 research/jadx-out/
 research/*decompile*.log
 research/oura-apk/
 *.smali
-**/com/ouraring/**
