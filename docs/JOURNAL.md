@@ -262,3 +262,28 @@ a real challenge-response. We can re-authenticate at will, no pairing mode, no O
 ### Explorer command surface (final for this phase)
 --oura · --connect <uuid> · --name <s> · --takeover · --auth [hex] · --reset [hex]
 · --store-key <hex> · --selftest · (default) scan-all
+
+---
+
+## 2026-06-04 — "Restricted mode" experiment: takeover holds against Oura ✅
+
+User tried to reconnect the (taken-over) ring to the official Oura app on Android
+WITHOUT factory-resetting first. Result:
+1. Pairing mode → Oura app connects at BLE level.
+2. App authenticates with ITS old Oura key → ring has OUR key → mismatch →
+   ring rejects (matches code 0x03 "not original onboarded device").
+3. App entered **"RESTRICTED MODE — only factory reset possible"**.
+4. User had to factory-reset to let the Oura app reclaim the ring.
+
+This is strong confirmation of our whole model:
+- Our takeover was real and robust: the official app + the user's own account
+  COULD NOT reclaim the ring while our key was set.
+- "Restricted mode" == the 0x03 FAILURE_NOT_ORIGINAL_ONBOARDED_DEVICE state. The
+  ring only allows a factory reset to a non-owning authenticator. Anti-theft works.
+- The loop is fully reversible both ways: Oura→us (takeover after reset) and
+  us→Oura (app reclaims after reset).
+
+⚠️ Consequence: the factory reset ERASED our key from the ring; Oura re-onboarded
+it with a fresh Oura key. Our stored key <stale-key… is now STALE (no longer matches
+the ring). Cleared it from the Keychain. We'll re-takeover (new random key) after
+the next factory reset.
