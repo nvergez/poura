@@ -10,33 +10,58 @@ data **without going through the Oura app or Oura's servers**.
 
 ## Status
 
-🟡 Phase 0 — Recon & documentation. No application code yet.
+🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
+authenticated, **zero Oura app/cloud** in the auth path. Next: reading data + iOS app.
 
 ## Goals
 
-### Current goal (the challenge)
-**Pair with the ring and read its data without the official Oura app, from scratch.**
-See [`docs/STRATEGY.md`](docs/STRATEGY.md) — it's harder than it looks, and the
-go/no-go hinges on a precise crypto question (the origin of the `auth_key`).
+### Current goal (the challenge) — ✅ DONE
+**Pair with the ring and authenticate without the official Oura app, from scratch.**
+Achieved: after a factory reset, our macOS tool sets its own `auth_key` on the ring
+and authenticates. The official Oura app can no longer reclaim the ring (it enters
+"restricted mode") until a factory reset — proving the takeover holds.
 
-### Longer-term goal (documented for later)
-A native, standalone iOS app (Swift / CoreBluetooth) that talks directly to the
-ring. **Clean-room implementation in Swift**, using the existing projects
-(`open_ring`, `ringverse`) only as **reference documentation**, not as a code
-base.
+### Next
+- Read real data over BLE (battery, firmware, then HR/IBI/temp/accel/PPG records).
+- Port to a native iOS app (Swift / CoreBluetooth), reusing `OuraProtocol.swift`.
+  Clean-room: `open_ring`/`ringverse` used only as reference docs, not as a codebase.
 
-## What the research established (summary)
+## What we established (verified on the real ring)
 
-- The Oura Ring 4 BLE protocol **has already been publicly RE'd** (`open_ring`,
-  `ringverse`). GATT, opcodes, formats, AES-128-ECB handshake: documented.
-- **Known WALL**: the ring requires a unique 16-byte `auth_key`, generated during
-  official onboarding (Oura account + servers) and never publicly derived. Without
-  it, the ring responds `0x03` "not the original onboarded device".
-- You only get the **raw biosignals** (PPG, IBI, accelerometer, temp, battery) —
-  not the sleep/readiness scores (computed in the Oura cloud).
-- The **Gen3** BLE protocol is NOT publicly documented. Everything here targets the Ring 4.
+- **auth_key is generated LOCALLY** by the phone (random), NOT server-side — so a
+  factory-reset ring accepts a fresh `SetAuthKey` (0x24) with no server validation.
+  The "wall" was never crypto; it was a protocol/state question.
+- **Takeover sequence** (after factory reset, ring in **pairing mode** = remove
+  from charger + put back → white blinking light): connect → BLE bond (Just Works)
+  → `SetAuthKey(our 16B key)` → `GetAuthNonce` → `Authenticate` with
+  `proof = AES-128-ECB(key, nonce15 ‖ 0x01)` → ring returns `0x00`.
+- **GATT**: service `98ED0001…`; write commands → `98ED0002` (handle 0x0015),
+  responses notify on `98ED0003` (handle 0x0012).
+- You only get **raw biosignals** (PPG, IBI, accel, temp, battery) — not the
+  sleep/readiness scores (those are computed in the Oura cloud).
+- Ring identity: hardware "ORE_06" / codename **oreo** (a Ring 4 variant).
 
-Full details and sources in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+Full details: [`docs/CAPTURE_ANALYSIS.md`](docs/CAPTURE_ANALYSIS.md),
+[`docs/JOURNAL.md`](docs/JOURNAL.md), [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+## BLE explorer — usage
+
+```bash
+cd ble-explorer && swift build
+.build/debug/ble-explorer --selftest          # validate AES-128-ECB (no BLE)
+.build/debug/ble-explorer                      # scan & list nearby BLE devices
+.build/debug/ble-explorer --oura               # find + connect the ring, dump GATT
+.build/debug/ble-explorer --takeover           # set OUR key on a FACTORY-RESET ring (pairing mode)
+.build/debug/ble-explorer --auth [hexkey]      # authenticate (key from arg or Keychain)
+.build/debug/ble-explorer --reset [hexkey]     # authenticate then factory-reset (give ring back)
+.build/debug/ble-explorer --store-key <hexkey> # save a key into the macOS Keychain
+```
+The auth_key is stored in the **macOS Keychain** (`--takeover` auto-stores it).
+If a re-takeover fails with "Peer removed pairing information", forget the ring in
+System Settings → Bluetooth (stale bond) and retry.
+
+⚠️ **Key loss**: if the key is lost, the ring is NOT bricked — do a physical reset
+(ring on powered charger, tap charger on a hard surface ~5-10×) then re-takeover.
 
 ## Hardware setup
 
@@ -54,9 +79,11 @@ ble-explorer/  BLE exploration tool (macOS/CLI) — scan, connect, dump GATT
 ios-app/       The final iOS app (Swift)
 ```
 
-## ⚠️ Feasibility warning
+## Reproduce the takeover (quick start)
 
-Pulling off "pair without the Oura app" means succeeding at **A** (BLE bond —
-feasible) **AND** **B** (`auth_key` handshake — novel research, possibly
-infeasible). We only commit to B after the key-origin investigation. See
-STRATEGY.md.
+1. Factory-reset the ring (Oura app → ring icon → Factory Reset; or physical reset).
+   Do **not** complete a new Oura onboarding afterward.
+2. Put the ring in **pairing mode**: remove from charger, put back → white blinking.
+3. `cd ble-explorer && swift build && .build/debug/ble-explorer --takeover`
+4. On success the ring trusts our key (stored in Keychain). `--auth` re-authenticates
+   anytime. The Oura app can reclaim it only after another factory reset.
