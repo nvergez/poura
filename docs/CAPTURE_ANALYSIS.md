@@ -85,3 +85,47 @@ Key distribution: LTK + IRK + CSRK
 1. To go zero-Oura we still need the auth_key. Extract from Android Realm now?
 2. Can we replay the SMP bond from macOS/iOS (CoreBluetooth abstracts the LTK)?
 3. Exact CCCD enable + MTU exchange order to keep the link alive in pairing mode.
+
+---
+
+## Auth handshake DECODED byte-by-byte (frames 869-876)
+
+```
+869 →ring:  2f 01 2b                          GetAuthNonce
+872 ring→:  2f 10 2c | <15-byte nonce>        GetAuthNonce response
+            nonce = 0e 35 0b 8c 26 f0 11 84 e8 98 53 6c 65 26 66   (15 bytes)
+873 →ring:  2f 11 2d | <16-byte proof>        Authenticate
+            proof = 90 42 c4 89 71 fe 86 11 14 a5 1e 2b c1 a5 8c 01 (16 bytes)
+876 ring→:  2f 02 2e 00                       AuthResponse = 0x00 SUCCESS ✅
+```
+Confirms: nonce = 15 bytes → `nonce ‖ 0x01` = 16 = one AES block.
+proof = 16 bytes. Per research: `proof = AES_128_ECB(auth_key, nonce ‖ 0x01)`.
+(Cannot re-verify the AES mode without the key; two sources concur — validate
+empirically after we set OUR key.)
+
+## Ring identity (from GetProductInfo responses, frames 900-920)
+- 900: `19 11 00 39313331 4f52455f3036 …` = ASCII "9131" + "ORE_06"
+- 904: `19 11 00 4f52455f3036 …` = "ORE_06"
+- 916/920: "<build-id-redacted>" / "<serial-redacted>" — firmware/build ids
+→ Hardware type "ORE_06" maps to codename **oreo** → **this ring is "oreo"**
+  in Oura's nomenclature (one of the Ring 4 variants).
+
+## Extended-tag (0x2F) opcode map (CONFIRMED from capture)
+| sub | dir | meaning |
+|-----|-----|---------|
+| 0x01 | req/resp | GetCapabilities |
+| 0x2B | req | GetAuthNonce |
+| 0x2C | resp | GetAuthNonce response (15-byte nonce) |
+| 0x2D | req | Authenticate (16-byte proof) |
+| 0x2E | resp | AuthResponse (00=success) |
+| 0x20/0x22/0x26 | req | feature get/set/subscription |
+| 0x21/0x23 | resp | feature responses |
+
+## Direct opcodes (handle 0x0015 write / 0x0012 notify) CONFIRMED
+0x08 GetFirmwareVersion · 0x0C GetBatteryLevel · 0x10 GetEvent ·
+0x12 SyncTime · 0x16 SetBleMode · 0x18 GetProductInfo · 0x1C SetNotification ·
+0x20 SetUserInfo · 0x28 data_flush. (0x24 SetAuthKey NOT used here — H2.)
+
+## GATT handles (confirmed)
+- Write characteristic: handle **0x0015** (commands)
+- Notify characteristic: handle **0x0012** (responses) — CCCD at 0x0013

@@ -35,6 +35,8 @@ enum Mode {
     case ouraOnly
     case connect(uuid: UUID)
     case byName(substring: String)
+    case takeover         // scan ring (pairing mode) → bond → SetAuthKey(ours) → Authenticate
+    case selftest         // validate AES-128-ECB against a known FIPS-197 vector, no BLE
 }
 
 func parseArgs() -> (mode: Mode, scanSeconds: Double) {
@@ -46,6 +48,10 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
         switch args[i] {
         case "--oura":
             mode = .ouraOnly
+        case "--takeover":
+            mode = .takeover
+        case "--selftest":
+            mode = .selftest
         case "--connect":
             if i + 1 < args.count, let u = UUID(uuidString: args[i + 1]) {
                 mode = .connect(uuid: u); i += 1
@@ -105,6 +111,13 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var pendingReads = 0
     var didFinishDiscovery = false
 
+    // Takeover state
+    var writeChar: CBCharacteristic?      // Oura command char (handle 0x0015)
+    var notifyChar: CBCharacteristic?     // Oura response char (handle 0x0012)
+    var myAuthKey: Data = OuraProtocol.randomAuthKey()
+    enum TakeoverStep { case idle, notifyEnabled, sentSetAuthKey, sentNonce, sentAuth, done }
+    var takeoverStep: TakeoverStep = .idle
+
     init(mode: Mode, scanSeconds: Double) {
         self.mode = mode
         self.scanSeconds = scanSeconds
@@ -147,18 +160,21 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             log("[ble] Peripheral \(uuid) not cached; scanning to find it (waiting for a strong-enough advert)…")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        case .ouraOnly:
+        case .ouraOnly, .takeover:
+            if case .takeover = mode {
+                log("[takeover] ⚠️ This will SET OUR OWN auth_key on the ring. Only run on a FACTORY-RESET ring.")
+                log("[takeover] Put the ring in PAIRING MODE: remove from charger and put it back (white blinking light).")
+            }
             log("[ble] Scanning for Oura service \(ouraServiceUUID.uuidString)…")
-            // Scan with the service filter; some peripherals only advertise the
-            // service in the scan response, so also keep a broad fallback.
             central.scanForPeripherals(withServices: [ouraServiceUUID], options: nil)
-            // Fallback broad scan after a short delay if nothing shows up.
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
                 guard let self, self.target == nil else { return }
-                self.log("[ble] No Oura-service advert yet; widening to a full scan (matching by name 'oura' too)…")
+                self.log("[ble] No Oura-service advert yet; widening to a full scan…")
                 self.central.stopScan()
                 self.central.scanForPeripherals(withServices: nil, options: nil)
             }
+        case .selftest:
+            break // handled before BLE starts
         case .byName, .scanAll:
             log("[ble] Scanning all peripherals for \(Int(scanSeconds))s…")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
@@ -213,13 +229,15 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                            peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
                            mfg.isEmpty ? "" : "  mfg=[\(mfg)]"))
             }
-        case .ouraOnly:
+        case .ouraOnly, .takeover:
             let advertisesOura = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) ?? false
             if advertisesOura || advName.lowercased().contains("oura") {
-                log("[ble] Found candidate Oura device: \(advName) [\(peripheral.identifier.uuidString)] rssi=\(RSSI.intValue)")
+                log("[ble] Found candidate Oura device: \(advName) [\(peripheral.identifier.uuidString)] rssi=\(RSSI.intValue) connectable=\(connStr)")
                 central.stopScan()
                 connect(peripheral)
             }
+        case .selftest:
+            break
         case .byName(let sub):
             if advName.lowercased().contains(sub.lowercased()) {
                 log("[ble] Name match: \(advName) [\(peripheral.identifier.uuidString)]")
@@ -288,18 +306,64 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         for c in chars {
             let marker = c.uuid == ouraNotifyCharUUID ? "  ⟵ OURA NOTIFY" : ""
             log("    └ char \(c.uuid.uuidString)  props=[\(describeProperties(c.properties))]\(marker)")
-            // Read any readable characteristic (read-only behavior).
-            if c.properties.contains(.read) {
+
+            // In takeover mode, capture the Oura write + notify characteristics.
+            if case .takeover = mode, service.uuid == ouraServiceUUID {
+                if c.properties.contains(.notify) || c.properties.contains(.indicate) {
+                    notifyChar = c
+                }
+                if c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse) {
+                    writeChar = c
+                }
+            }
+
+            // Read any readable characteristic (read-only behavior) — NOT in takeover.
+            if c.properties.contains(.read), !isTakeover {
                 pendingReads += 1
                 peripheral.readValue(for: c)
             }
-            // Also discover descriptors for completeness.
             peripheral.discoverDescriptors(for: c)
         }
-        checkDone(peripheral)
+
+        if isTakeover, let nc = notifyChar, writeChar != nil, takeoverStep == .idle {
+            log("[takeover] Found Oura write + notify chars. Enabling notifications…")
+            peripheral.setNotifyValue(true, for: nc)
+            // Handshake proceeds in didUpdateNotificationStateFor.
+        } else if !isTakeover {
+            checkDone(peripheral)
+        }
+    }
+
+    var isTakeover: Bool { if case .takeover = mode { return true } else { return false } }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        guard isTakeover, characteristic == notifyChar else { return }
+        if let error { log("[takeover] Failed to enable notifications: \(error.localizedDescription)"); exit(1) }
+        guard takeoverStep == .idle else { return }
+        takeoverStep = .notifyEnabled
+        log("[takeover] Notifications enabled. My auth_key = \(hex(myAuthKey))")
+        log("[takeover] → SetAuthKey (0x24)…")
+        takeoverStep = .sentSetAuthKey
+        write(OuraProtocol.setAuthKey(myAuthKey))
+    }
+
+    func write(_ data: Data) {
+        guard let wc = writeChar, let p = target else { return }
+        log("[takeover]   write: \(hex(data))")
+        // Use withResponse if supported, else withoutResponse.
+        let type: CBCharacteristicWriteType = wc.properties.contains(.write) ? .withResponse : .withoutResponse
+        p.writeValue(data, for: wc, type: type)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        // Takeover: drive the auth handshake from notify responses.
+        if isTakeover, characteristic == notifyChar {
+            guard let data = characteristic.value else { return }
+            let parsed = OuraProtocol.parseNotification(data)
+            log("[takeover]   notify: \(hex(data))  → \(parsed.kind)")
+            handleTakeoverNotification(parsed, peripheral: peripheral)
+            return
+        }
         pendingReads = max(0, pendingReads - 1)
         if let error {
             log("      [read] \(characteristic.uuid.uuidString): error \(error.localizedDescription)")
@@ -307,6 +371,57 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             log("      [read] \(characteristic.uuid.uuidString): \(data.count)B  hex=[\(hex(data))]  ascii=\"\(ascii(data))\"")
         }
         checkDone(peripheral)
+    }
+
+    func handleTakeoverNotification(_ parsed: (kind: String, payload: Data), peripheral: CBPeripheral) {
+        switch parsed.kind {
+        case "setauthkey":
+            let code = parsed.payload.first ?? 0xFF
+            if code == 0x00 || code == 0x05 {
+                log("[takeover] ✅ SetAuthKey accepted (code=0x\(String(format: "%02x", code))). → GetAuthNonce…")
+                takeoverStep = .sentNonce
+                write(OuraProtocol.getAuthNonce())
+            } else {
+                log("[takeover] ❌ SetAuthKey REJECTED (code=0x\(String(format: "%02x", code))). Ring likely NOT factory-reset (still claimed). Stopping.")
+                finishTakeover(peripheral, success: false)
+            }
+        case "nonce":
+            let nonce = parsed.payload
+            guard nonce.count == 15 else {
+                log("[takeover] ❌ Unexpected nonce length \(nonce.count) (expected 15). Stopping."); finishTakeover(peripheral, success: false); return
+            }
+            guard let proof = OuraProtocol.computeProof(authKey: myAuthKey, nonce15: nonce) else {
+                log("[takeover] ❌ Proof computation failed."); finishTakeover(peripheral, success: false); return
+            }
+            log("[takeover] nonce=\(hex(nonce)) → proof=\(hex(proof)). → Authenticate…")
+            takeoverStep = .sentAuth
+            write(OuraProtocol.authenticate(proof: proof))
+        case "auth":
+            let code = parsed.payload.first ?? 0xFF
+            if code == 0x00 {
+                log("[takeover] 🎉🎉 AUTHENTICATED with OUR key! The ring is now ours. (code=0x00)")
+                finishTakeover(peripheral, success: true)
+            } else {
+                let meaning = ["0x01":"auth error", "0x02":"in factory reset", "0x03":"not original onboarded device"]["0x\(String(format: "%02x", code))"] ?? "unknown"
+                log("[takeover] ❌ Authenticate failed (code=0x\(String(format: "%02x", code)) = \(meaning)).")
+                finishTakeover(peripheral, success: false)
+            }
+        default:
+            break // ignore other notifications during takeover
+        }
+    }
+
+    func finishTakeover(_ peripheral: CBPeripheral, success: Bool) {
+        guard takeoverStep != .done else { return }
+        takeoverStep = .done
+        if success {
+            log("\n[takeover] ✅ SUCCESS. Save THIS key to talk to the ring from now on:")
+            log("[takeover]   AUTH_KEY=\(hex(myAuthKey).replacingOccurrences(of: " ", with: ""))")
+        } else {
+            log("\n[takeover] ✗ Takeover did not complete. See messages above.")
+        }
+        central.cancelPeripheralConnection(peripheral)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(success ? 0 : 1) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverDescriptorsFor characteristic: CBCharacteristic, error: Error?) {
@@ -334,6 +449,36 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 }
 
 let (mode, scanSeconds) = parseArgs()
+
+// Self-test: validate AES-128-ECB against the FIPS-197 known-answer vector BEFORE
+// trusting it on real hardware. No Bluetooth involved.
+if case .selftest = mode {
+    // FIPS-197 Appendix B / C.1: key 000102…0f, plaintext 00112233…ff →
+    // ciphertext 69c4e0d86a7b0430d8cdb78070b4c55a
+    let key = Data((0...15).map { UInt8($0) })
+    let pt  = Data([0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff])
+    let expected = "69c4e0d86a7b0430d8cdb78070b4c55a"
+    guard let ct = OuraProtocol.aes128ECBEncrypt(key: key, block16: pt) else {
+        print("[selftest] ❌ AES returned nil"); exit(1)
+    }
+    let got = ct.map { String(format: "%02x", $0) }.joined()
+    print("[selftest] AES-128-ECB(0x000102…0f, 0x00112233…ff)")
+    print("[selftest]   expected = \(expected)")
+    print("[selftest]   got      = \(got)")
+    if got == expected {
+        print("[selftest] ✅ AES-128-ECB is correct. Proof computation can be trusted.")
+        // Also demo the proof builder with a sample 15-byte nonce (sanity, not a KAT).
+        let nonce = Data((1...15).map { UInt8($0) })
+        let demoKey = OuraProtocol.randomAuthKey()
+        if let proof = OuraProtocol.computeProof(authKey: demoKey, nonce15: nonce) {
+            print("[selftest]   demo proof len = \(proof.count) (expect 16)")
+        }
+        exit(0)
+    } else {
+        print("[selftest] ❌ MISMATCH — do NOT use this for takeover."); exit(1)
+    }
+}
+
 let explorer = Explorer(mode: mode, scanSeconds: scanSeconds)
 
 // Overall safety timeout so the process never hangs forever.
