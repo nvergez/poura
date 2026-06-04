@@ -8,7 +8,6 @@ data **without going through the Oura app or Oura's servers**.
 > redistribution of Oura firmware, no circumvention of Oura's servers for
 > commercial purposes.
 
-
 ## Status
 
 🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
