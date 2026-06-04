@@ -287,3 +287,22 @@ This is strong confirmation of our whole model:
 it with a fresh Oura key. Our stored key <stale-key… is now STALE (no longer matches
 the ring). Cleared it from the Keychain. We'll re-takeover (new random key) after
 the next factory reset.
+
+---
+
+## 2026-06-04 — Re-takeover successful (new key) + Mac bond gotcha
+
+After the user re-onboarded to Oura then factory-reset again, we re-took the ring.
+
+- **Gotcha**: first re-takeover attempt failed with "Peer removed pairing
+  information" — the Mac cached a stale BLE bond (LTK) from the FIRST takeover,
+  but the ring had since been reset (dropped its side). Fix: forget the ring in
+  macOS System Settings → Bluetooth (real MAC <mac-redacted>). Then takeover
+  succeeded cleanly (fresh bond). → The iOS app must handle/clear stale bonds on
+  re-takeover.
+- New key set & stored in Keychain (auto). Ring authenticated (0x00). Full cycle
+  proven twice, both directions.
+
+### Note for iOS app
+Stale-bond handling is required: on "peer removed pairing information", clear the
+system bond (or guide the user to forget the device) before reconnecting.
