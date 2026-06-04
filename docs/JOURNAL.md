@@ -183,3 +183,44 @@ foundation of the final iOS app.
 
 In parallel (background): static analysis of whether ResetMemory (0x1A) requires
 prior auth — to know if a pure-BLE takeover (no physical reset) is possible.
+
+---
+
+## 2026-06-04 — 🎉 TAKEOVER SUCCESS — ring authenticated with OUR key, zero Oura
+
+The core goal is achieved. After a factory reset (via the Oura app, which itself
+requires auth first — sent `ResetMemory(false)`=`[0x1A,0x00]` at frame 2746 of the
+reset capture, AFTER authenticating), the ring was keyless. Our macOS tool then:
+
+```
+connect (pairing mode) → bond (Just Works, automatic) →
+SetAuthKey(0x24, OUR random 16B)  → resp 25 01 00      (0x00 SUCCESS)
+GetAuthNonce(2F 01 2B)            → 2F 10 2C <15B nonce>
+proof = AES-128-ECB(ourKey, nonce ‖ 0x01)
+Authenticate(2F 11 2D <16B proof>) → 2F 02 2E 00        (0x00 SUCCESS) 🎉
+```
+
+→ The ring now trusts OUR key. No Oura app/cloud involved in the auth.
+Proves: (a) a factory-reset ring ACCEPTS a fresh SetAuthKey with no server
+validation (key is purely local, as the static analysis predicted); (b) the SMP
+bond works from CoreBluetooth on macOS; (c) our AES-128-ECB proof is correct (ring
+returned 0x00). Our key saved in secrets/ (git-ignored).
+
+### Confirmed GATT (real ring, codename "oreo" / hw ORE_06)
+Service 98ED0001-A541-11E4-B6A0-0002A5D5C51B:
+- 98ED0002 [write/writeNoResp]      ← command WRITE (handle 0x0015)
+- 98ED0003 [read,notify]            ← response NOTIFY (handle 0x0012)
+- 98ED0004 [read,write,notify,indicate]
+- 98ED0005 [writeNoResp,notify]
+- 98ED0006 [writeNoResp,notify]
+Service 00060000-F8CE-11E4-ABF4-0002A5D5C51B: 00060001 [write,notify] (DFU?)
+
+### Bug found & fixed
+First takeover attempt wrote to the wrong characteristic: a property-based
+heuristic matched 98ED0004 (also write+notify) instead of 98ED0002/98ED0003.
+Fixed by matching exact UUIDs. Lesson: target Oura chars by UUID, not properties.
+
+### Next
+- Read real data: enable notifications + GetEvent (0x10) / battery (0x0C) /
+  product info (0x18) / live stream. Decode TLV records (PPG/IBI/accel/temp).
+- Port this to the iOS app (ios-app/), reusing OuraProtocol.swift.

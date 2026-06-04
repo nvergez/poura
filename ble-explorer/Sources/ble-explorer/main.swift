@@ -21,9 +21,11 @@ import CoreBluetooth
 // redirected to a file (otherwise libc block-buffers and we see nothing live).
 setbuf(stdout, nil)
 
-// Known Oura Ring 4 GATT identifiers (from research — to be VALIDATED against the
-// real ring; see docs/PROTOCOL.md). The primary custom service:
+// Oura Ring 4 GATT identifiers — CONFIRMED against the real ring + btsnoop capture.
+// Service 98ED0001; write commands → 98ED0002 (handle 0x0015), responses notify on
+// 98ED0003 (handle 0x0012).
 let ouraServiceUUID = CBUUID(string: "98ed0001-a541-11e4-b6a0-0002a5d5c51b")
+let ouraWriteCharUUID = CBUUID(string: "98ed0002-a541-11e4-b6a0-0002a5d5c51b")
 let ouraNotifyCharUUID = CBUUID(string: "98ed0003-a541-11e4-b6a0-0002a5d5c51b")
 
 // Standard services worth reading for context (cleartext, no auth needed):
@@ -307,14 +309,12 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let marker = c.uuid == ouraNotifyCharUUID ? "  ⟵ OURA NOTIFY" : ""
             log("    └ char \(c.uuid.uuidString)  props=[\(describeProperties(c.properties))]\(marker)")
 
-            // In takeover mode, capture the Oura write + notify characteristics.
+            // In takeover mode, capture the EXACT Oura write + notify characteristics
+            // by UUID (confirmed from capture). Heuristics on properties pick the
+            // wrong char (98ED0004 also has write+notify) — match UUIDs explicitly.
             if case .takeover = mode, service.uuid == ouraServiceUUID {
-                if c.properties.contains(.notify) || c.properties.contains(.indicate) {
-                    notifyChar = c
-                }
-                if c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse) {
-                    writeChar = c
-                }
+                if c.uuid == ouraNotifyCharUUID { notifyChar = c }
+                if c.uuid == ouraWriteCharUUID { writeChar = c }
             }
 
             // Read any readable characteristic (read-only behavior) — NOT in takeover.
