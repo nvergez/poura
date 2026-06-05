@@ -306,3 +306,141 @@ After the user re-onboarded to Oura then factory-reset again, we re-took the rin
 ### Note for iOS app
 Stale-bond handling is required: on "peer removed pairing information", clear the
 system bond (or guide the user to forget the device) before reconnecting.
+
+---
+
+## 2026-06-05 — DATA RETRIEVAL working (`--read`): infos + TLV history decoded
+
+Added a `--read` mode to `ble-explorer`. After the saved-key handshake it replays
+the app's post-auth init, queries device info, then opens the data plane. **First
+real data read from the ring without the Oura app — both simple infos and decoded
+TLV records.**
+
+### What now works (verified on the real ring, worn)
+
+**Simple infos (request → response tag = request opcode + 1):**
+- `GetFirmwareVersion (0x08 03 00 00 00)` → `09 …`: firmware bytes
+  `02 00 00 02 0b …` → version **2.0.0.2.11** family.
+- `GetBatteryLevel (0x0C 00)` → `0d 06 60 …`: `0x60 = 96%`.
+- `GetProductInfo (0x18 03 <sub> 00 10)` → `19 11 00 …` ASCII identity:
+  `9131`, **`ORE_06`** (codename oreo), serial **`2016092441019131`**
+  (= the ring's BLE name).
+
+**Post-auth init acks observed:** `17`=SetBleMode, `13`=SyncTime (body carries the
+ring's current ringTimestamp, e.g. `0x00057640`), `1d`=SetNotification,
+`29`=data_flush.
+
+**The stream trigger:** `SetNotification (1c 01 bf)` alone stays SILENT. It is
+**`data_flush (0x28 01 00)`** that releases the buffered events onto the BLE notify
+stream. We now send it unconditionally to open the firehose. (Confirmed against
+open_ring's PROTOCOL.md and then on our ring: data_flush → ~250 records.)
+
+**GetEvent (history) wire format corrected to 11 bytes:**
+`10 09 <cursor u32 LE> <max_events u8> <flags u32 LE=FFFFFFFF>`.
+`--read --history` dumps from cursor 0 (full flash history).
+
+### TLV record decode — VALIDATED on our own data
+
+Format `[type:1][len:1][ctr_lo ctr_hi][ses_lo ses_hi][payload(len-4)]`,
+`ringTimestamp=(session<<16)|counter`. Our decoder framed ~256 back-to-back records
+cleanly (counters increment 1393,1394,1395…). Types seen in this dump:
+
+| Type | Name | Content (decoded from real payloads) |
+|------|------|--------------------------------------|
+| `0x41` | boot/start | `10 00 00 00 32 02 0b …` → fw `2.0.b…` at boot |
+| `0x42` | time-anchor | unix ts LE — e.g. `08 ef 21 6a` → wall-clock anchor for ringTimestamps |
+| `0x43` | **diag-log** | **ASCII** text lines (NEW finding). Examples below. |
+| `0x61` | event | binary event/counter records |
+
+`0x43` diagnostic strings decoded from the boot log:
+`git;29df664` (fw commit), `SNH;019131`+`SNL;2016092441` (serial halves),
+`HWID;ORE_06`, `acm_bma456` (**accelerometer = Bosch BMA456**), `MFC;500;4`,
+`rdata init`, `in_bed=0`, plus charge telemetry `chgv;…`, `chg_hs;…`, `chg_rp;…`,
+`FGdcap;39`, `BMVbI;50`.
+
+### Not yet captured: raw biosignals (PPG 0x81 / IBI 0x80 / accel 0x33 / temp)
+
+The history we pulled was dominated by **system/charge events** (the ring had just
+been on the charger). No 0x80/0x81/0x33 records appeared yet. Hypothesis: the ring
+pauses PPG measurement during an active BLE connection, and/or a measurement-start
+opcode is needed. **Next session**: chase the biosignals (see NEXT.md).
+
+### Files
+- `OuraProtocol.swift`: added `getFirmwareVersion`, `setBleMode`, `syncTime`,
+  `setNotification`, `dataFlush`, fixed `getEvent` (11B), `Record` + `decodeRecords`
+  (defensive TLV walk), `recordTypeName`.
+- `main.swift`: new `.read(key, seconds, history)` mode; `--read [hex] [--history]
+  [--seconds N]`; post-auth staged sequence; `handleReadNotification` (info vs TLV);
+  rolling `streamLeftover` buffer for cross-notification record framing; per-type
+  summary at the end.
+
+---
+
+## 2026-06-05b — Biosignals: measurement TRIGGER found + live AFE stream (worn ring)
+
+Chased the raw biosignals. Key unlock: the ring does NOT emit physiological records
+just because you connect + `data_flush`. It needs an explicit **feature subscribe**.
+
+### How we found it
+The first `--read --history` dump (ring fresh off charger) returned ~256 records but
+all system/charge events (`0x43` ASCII logs, `0x61`), no PPG/IBI. A second run with an
+empty flash buffer returned **zero** records → `data_flush` only drains existing
+buffer; it doesn't start measurement.
+
+Decoded the onboarding btsnoop (`captures/poura-onboarding.btsnoop`, frames 926-992)
+with tshark to get the app's exact post-battery sequence. It runs a feature
+get/set/**subscribe** block via ext `0x2F`:
+```
+get:        2f 02 20 <id>          → 2f 06 21 <id> <4B value>
+set:        2f 03 22 <id> <val>    → 2f 03 23 <id> <val>     (ack)
+subscribe:  2f 03 26 <id> <val>    → 2f 03 27 <id> <code>    (ack)  ← the trigger
+```
+The decisive pair before the stream opens: `2f 03 22 02 03` (set feat 0x02=3) then
+`2f 03 26 02 02` (**subscribe feat 0x02=2**), then `28 01 00` (data_flush).
+
+### Result on OUR worn ring (verified)
+Implemented the subscribe block in `--read`. On a worn ring it produces a **live
+data stream** — continuous notifications, no Oura app:
+```
+2f 0f 28 02 <chan> 02 00 00 <value u16 LE> 00 00 00 00 59 0a 7f
+```
+- `chan` ∈ {0x09, 0x19}. Channel 0x09 value ≈ **5150 ± 60**, stable at rest, jumps
+  (13191, 8726…) when the finger moves. → very likely the **PPG DC level** (mean
+  reflected light), a real physiological signal.
+- Rate ≈ 0.5–1 Hz. This is an AFE stat/quality channel, **not** the high-rate AC
+  PPG waveform.
+
+### Probed all features, only 0x02 streams
+Added `--features <hex,…>` to subscribe to arbitrary feature IDs. Subscribed to
+`0x02,0x03,0x04,0x0b,0x0d,0x10` (all the ones the app gets). **All ACK the subscribe
+(`2f 03 27 <id> 02`) but only 0x02 emits data.** The high-rate PPG waveform + IBI
+(beat intervals) did not appear.
+
+### Open question (honest status)
+The raw high-frequency PPG (`0x81`, AC waveform) and IBI (`0x80`/`0x60`, beat
+intervals) are **not** streamed by feature 0x02 on a connected, idle worn ring.
+Most likely the ring only runs high-rate PPG during **scheduled measurement sessions**
+(sleep / spot-check), not continuously over an active BLE link (power). The
+onboarding capture's `0x81`/`0x80` records were emitted during a measurement
+transition, not steady-state streaming. Next: trigger/observe a measurement session,
+or find the feature/flag that forces continuous high-rate PPG.
+
+### Decoders added (verified formats, ready for when those records appear)
+From the onboarding capture + open_ring cross-ref (an `Explore`-style sub-agent
+decoded the capture; we kept only byte-verified claims):
+- `0x46` TEMP: 3× i16 LE /100 = °C.
+- `0x80` GREEN_IBI_QUALITY: N× u16 LE; bits 0-10 = IBI ms, 11-13 qual_a, 14-15 qual_b
+  (clean beat = qual_a≤1 & qual_b==0).
+- `0x60` IBI+amplitude: bit-packed (left raw — packing needs worn-data validation).
+- Record type names extended: 0x46 temp, 0x47 motion, 0x53 wear, 0x60 IBI+amp,
+  0x61 debug-data (payload[0]=sub-dispatch), 0x79 AFE-tuning.
+- ⚠️ Correction from the capture decode: `0x3d` is NOT a top-level type — it's a
+  `0x61` sub-type (charger debug), so those dense bytes were charge telemetry, not PPG.
+
+### Files
+- `OuraProtocol.swift`: `featureGet/Set/Subscribe`, `decodeBiosignal` (0x46/0x80),
+  extended `recordTypeName`.
+- `main.swift`: subscribe block in the read sequence (loops `--features`); live
+  `0x2F/0x28` stream decoder (chan + value); `--features <hex,…>` flag;
+  `streamSampleCount` in the summary.
+- Local captures (git-ignored): `poura-live-worn-stream.log`, `poura-feature-probe.log`.

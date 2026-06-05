@@ -9,6 +9,10 @@
 //   swift run ble-explorer --oura          # scan only for the Oura service, auto-connect & dump
 //   swift run ble-explorer --connect <UUID>  # connect to a specific peripheral identifier & dump
 //   swift run ble-explorer --name <substr> # auto-connect to first device whose name matches
+//   swift run ble-explorer --read [hexkey] [--history] [--seconds N]
+//                                          # auth (Keychain key) → read battery/firmware/
+//                                          #   product, then stream live TLV records for N s.
+//                                          # --history also fetches buffered flash history.
 //
 // Notes:
 //  - macOS will prompt for Bluetooth permission on first run.
@@ -40,6 +44,7 @@ enum Mode {
     case takeover         // scan ring (pairing mode) → bond → SetAuthKey(ours) → Authenticate
     case auth(key: Data)  // reconnect → GetAuthNonce → Authenticate with our saved key
     case reset(key: Data) // authenticate with our key, then ResetMemory (give the ring back)
+    case read(key: Data, seconds: Double, history: Bool, features: [UInt8]) // auth → read infos → subscribe → stream
     case storeKey(key: Data) // migrate a key into the macOS Keychain, no BLE
     case selftest         // validate AES-128-ECB against a known FIPS-197 vector, no BLE
 }
@@ -60,12 +65,37 @@ func hexToData(_ s: String) -> Data? {
 func parseArgs() -> (mode: Mode, scanSeconds: Double) {
     var mode: Mode = .scanAll
     var scanSeconds = 12.0
+    var wantRead = false       // deferred: --read may appear before/after --seconds/--history
+    var readKey: Data? = nil
+    var readHistory = false
+    var readSeconds = 20.0
+    var readFeatures: [UInt8] = [0x02]   // default: the AFE feature we know streams
     let args = Array(CommandLine.arguments.dropFirst())
     var i = 0
     while i < args.count {
         switch args[i] {
         case "--oura":
             mode = .ouraOnly
+        case "--read":
+            // Key from arg, else from Keychain. Resolved into a mode after the loop
+            // so --seconds / --history can appear in any order.
+            wantRead = true
+            if i + 1 < args.count, let k = hexToData(args[i + 1]) {
+                readKey = k; i += 1
+            } else {
+                readKey = Keychain.loadAuthKey()
+            }
+        case "--history":
+            readHistory = true
+        case "--features":
+            // Comma/space-separated hex feature IDs to subscribe, e.g. "02,03,0b".
+            if i + 1 < args.count {
+                let parsed = args[i + 1]
+                    .split(whereSeparator: { $0 == "," || $0 == " " })
+                    .compactMap { UInt8($0.replacingOccurrences(of: "0x", with: ""), radix: 16) }
+                if !parsed.isEmpty { readFeatures = parsed }
+                i += 1
+            }
         case "--takeover":
             mode = .takeover
         case "--auth":
@@ -112,12 +142,19 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
             }
         case "--seconds":
             if i + 1 < args.count, let s = Double(args[i + 1]) {
-                scanSeconds = s; i += 1
+                scanSeconds = s; readSeconds = s; i += 1
             }
         default:
             FileHandle.standardError.write(Data("Unknown arg: \(args[i])\n".utf8))
         }
         i += 1
+    }
+    if wantRead {
+        guard let k = readKey else {
+            FileHandle.standardError.write(Data("--read: provide a 32-hex key or store one first (--store-key)\n".utf8))
+            exit(2)
+        }
+        mode = .read(key: k, seconds: readSeconds, history: readHistory, features: readFeatures)
     }
     return (mode, scanSeconds)
 }
@@ -162,6 +199,15 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     enum TakeoverStep { case idle, notifyEnabled, sentSetAuthKey, sentNonce, sentAuth, done }
     var takeoverStep: TakeoverStep = .idle
 
+    // Read state
+    var readPhase = false          // true once auth succeeds in read mode → route notifies to read handler
+    var streamLeftover = Data()    // bytes from a previous notify that didn't frame a full record
+    var recordCounts: [UInt8: Int] = [:]  // per-type tally for the end-of-run summary
+    var streamSampleCount = 0      // live feature-data samples (2f/0x28) seen this run
+    var readStreamSeconds: Double { if case .read(_, let s, _, _) = mode { return s } else { return 20 } }
+    var readWantsHistory: Bool { if case .read(_, _, let h, _) = mode { return h } else { return false } }
+    var readFeatureIDs: [UInt8] { if case .read(_, _, _, let f) = mode { return f } else { return [0x02] } }
+
     init(mode: Mode, scanSeconds: Double) {
         self.mode = mode
         self.scanSeconds = scanSeconds
@@ -204,7 +250,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             log("[ble] Peripheral \(uuid) not cached; scanning to find it (waiting for a strong-enough advert)…")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        case .ouraOnly, .takeover, .auth, .reset:
+        case .ouraOnly, .takeover, .auth, .reset, .read:
             if case .takeover = mode {
                 log("[takeover] ⚠️ This will SET OUR OWN auth_key on the ring. Only run on a FACTORY-RESET ring.")
                 log("[takeover] Put the ring in PAIRING MODE: remove from charger and put it back (white blinking light).")
@@ -214,6 +260,10 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             if case .reset = mode {
                 log("[reset] ⚠️ This will AUTHENTICATE then FACTORY-RESET the ring (give it back). Data on the ring is erased.")
+            }
+            if case .read = mode {
+                log("[read] Reconnect → authenticate → read battery/firmware/product, then stream live records.")
+                log("[read] ⚠️ For physiological data (PPG/IBI/temp/accel) the ring must be WORN, not on the charger.")
             }
             log("[ble] Scanning for Oura service \(ouraServiceUUID.uuidString)…")
             central.scanForPeripherals(withServices: [ouraServiceUUID], options: nil)
@@ -279,7 +329,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                            peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
                            mfg.isEmpty ? "" : "  mfg=[\(mfg)]"))
             }
-        case .ouraOnly, .takeover, .auth, .reset:
+        case .ouraOnly, .takeover, .auth, .reset, .read:
             let advertisesOura = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) ?? false
             if advertisesOura || advName.lowercased().contains("oura") {
                 log("[ble] Found candidate Oura device: \(advName) [\(peripheral.identifier.uuidString)] rssi=\(RSSI.intValue) connectable=\(connStr)")
@@ -383,8 +433,9 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var isTakeover: Bool { if case .takeover = mode { return true } else { return false } }
     var isAuthOnly: Bool { if case .auth = mode { return true } else { return false } }
     var isReset: Bool { if case .reset = mode { return true } else { return false } }
-    var isHandshake: Bool { isTakeover || isAuthOnly || isReset }
-    var handshakeTag: String { isTakeover ? "takeover" : (isReset ? "reset" : "auth") }
+    var isRead: Bool { if case .read = mode { return true } else { return false } }
+    var isHandshake: Bool { isTakeover || isAuthOnly || isReset || isRead }
+    var handshakeTag: String { isTakeover ? "takeover" : (isReset ? "reset" : (isRead ? "read" : "auth")) }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard isHandshake, characteristic == notifyChar else { return }
@@ -393,10 +444,11 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard takeoverStep == .idle else { return }
         takeoverStep = .notifyEnabled
 
-        // auth & reset: authenticate first with the saved key (skip SetAuthKey).
+        // auth, reset & read: authenticate first with the saved key (skip SetAuthKey).
         var savedKey: Data? = nil
         if case .auth(let k) = mode { savedKey = k }
         if case .reset(let k) = mode { savedKey = k }
+        if case .read(let k, _, _, _) = mode { savedKey = k }
         if let key = savedKey {
             myAuthKey = key
             log("[\(tag)] Notifications enabled. Authenticating with saved key \(hex(myAuthKey))")
@@ -411,15 +463,21 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
-    func write(_ data: Data) {
+    func write(_ data: Data, label: String? = nil) {
         guard let wc = writeChar, let p = target else { return }
-        log("[takeover]   write: \(hex(data))")
+        log("[\(label ?? handshakeTag)]   write: \(hex(data))")
         // Use withResponse if supported, else withoutResponse.
         let type: CBCharacteristicWriteType = wc.properties.contains(.write) ? .withResponse : .withoutResponse
         p.writeValue(data, for: wc, type: type)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        // Read mode, post-auth: every notify is an info-response or a stream record.
+        if readPhase, characteristic == notifyChar {
+            guard let data = characteristic.value else { return }
+            handleReadNotification(data, peripheral: peripheral)
+            return
+        }
         // Takeover/auth: drive the handshake from notify responses.
         if isHandshake, characteristic == notifyChar {
             guard let data = characteristic.value else { return }
@@ -464,7 +522,9 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let code = parsed.payload.first ?? 0xFF
             if code == 0x00 {
                 log("[\(handshakeTag)] 🎉 AUTHENTICATED with OUR key (code=0x00).")
-                if isReset {
+                if isRead {
+                    startReadSequence(peripheral)
+                } else if isReset {
                     // Now give the ring back: ResetMemory.
                     log("[reset] → ResetMemory (factory reset, [0x1A 0x00])…")
                     takeoverStep = .done   // reuse; we wait for the reset response below via a fresh step guard
@@ -495,6 +555,210 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
     var resetSent = false
+
+    // MARK: - Read sequence (post-auth)
+
+    /// After auth succeeds, replay the app's post-auth init then query device info,
+    /// then open the live stream. All raw responses are logged + TLV-decoded so we
+    /// can validate formats against the real ring (observation-first, no guessing).
+    func startReadSequence(_ peripheral: CBPeripheral) {
+        guard !readPhase else { return }
+        readPhase = true
+        takeoverStep = .done   // stop the handshake state machine from re-entering
+        log("\n[read] ✅ Authenticated. Beginning read sequence.")
+
+        // 1) Post-auth init, mirroring the captured Android onboarding order:
+        //    SetBleMode(0x02) → SyncTime(now) → SetNotification(0xbf).
+        // SyncTime uses the current unix time so the ring anchors its tick counter.
+        let now = UInt32(Date().timeIntervalSince1970)
+        write(OuraProtocol.setBleMode(0x02), label: "read")
+        delay(0.4) { self.write(OuraProtocol.syncTime(unix: now), label: "read") }
+        delay(0.8) { self.write(OuraProtocol.setNotification(0xbf), label: "read") }
+
+        // 2) Device info queries (simple, short responses — our first real reads).
+        delay(1.3) {
+            self.log("[read] → GetFirmwareVersion (0x08)…")
+            self.write(OuraProtocol.getFirmwareVersion(), label: "read")
+        }
+        delay(1.8) {
+            self.log("[read] → GetBatteryLevel (0x0C)…")
+            self.write(OuraProtocol.getBatteryLevel(), label: "read")
+        }
+        // Product-info sub-queries observed in the capture (14/18/28/34/04/08).
+        let subs: [UInt8] = [0x14, 0x18, 0x28, 0x34, 0x04, 0x08]
+        for (n, sub) in subs.enumerated() {
+            delay(2.3 + Double(n) * 0.4) {
+                self.log("[read] → GetProductInfo sub=0x\(String(format: "%02x", sub)) (0x18)…")
+                self.write(OuraProtocol.getProductInfo(sub: sub), label: "read")
+            }
+        }
+
+        // 3) Feature subscribe block — replays the app's get/set/subscribe sequence
+        //    decoded from the capture (frames 926-992). For each requested feature:
+        //    get → set=0x03 → SUBSCRIBE=0x02. Feature 0x02 is the AFE channel we
+        //    confirmed streams on a worn ring; `--features` overrides the list so we
+        //    can probe others (0x03/0x04/0x0b/0x0d/0x10 seen in the capture) for the
+        //    raw PPG waveform / IBI channel.
+        let subStart = 2.3 + Double(subs.count) * 0.4 + 0.5
+        let feats = readFeatureIDs
+        delay(subStart) {
+            self.log("\n[read] → feature subscribe for IDs [\(feats.map { String(format: "0x%02x", $0) }.joined(separator: ", "))]…")
+        }
+        for (n, fid) in feats.enumerated() {
+            let base = subStart + Double(n) * 0.9
+            delay(base)       { self.write(OuraProtocol.featureGet(fid), label: "read") }
+            delay(base + 0.3) { self.write(OuraProtocol.featureSet(fid, 0x03), label: "read") }
+            delay(base + 0.6) { self.write(OuraProtocol.featureSubscribe(fid, 0x02), label: "read") }
+        }
+
+        // 4) Open the data plane. data_flush (0x28) releases buffered events onto the
+        //    BLE notify stream; combined with the subscribe above, new measurement
+        //    records should follow while the ring is worn.
+        let afterInfo = subStart + Double(feats.count) * 0.9 + 0.5
+        delay(afterInfo) {
+            self.log("\n[read] → data_flush (0x28) — release buffered events to the stream…")
+            self.write(OuraProtocol.dataFlush(), label: "read")
+        }
+
+        // Optional explicit history dump from cursor 0 (full flash history).
+        if readWantsHistory {
+            delay(afterInfo + 0.5) {
+                self.log("[read] → GetEvent (0x10) full history fetch from cursor 0…")
+                self.write(OuraProtocol.getEvent(cursor: 0), label: "read")
+            }
+        }
+
+        let streamStart = afterInfo + (readWantsHistory ? 1.0 : 0.4)
+        delay(streamStart) {
+            self.log("\n[read] === LIVE STREAM open for \(Int(self.readStreamSeconds))s — wear the ring, keep still for clean PPG/IBI ===")
+        }
+        // Close the stream window and summarize.
+        delay(streamStart + readStreamSeconds) {
+            self.finishRead(peripheral)
+        }
+    }
+
+    /// Schedule a closure on the main queue after `s` seconds (thin wrapper for
+    /// readability of the staged read sequence above).
+    func delay(_ s: Double, _ body: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: body)
+    }
+
+    /// Handle a notify in the post-auth read phase: classify info-responses vs
+    /// stream records. Info responses use the request-opcode+1 reply tags seen in
+    /// the capture (0x18→0x19 etc.); everything else we attempt to TLV-decode.
+    func handleReadNotification(_ data: Data, peripheral: CBPeripheral) {
+        guard let tag = data.first else { return }
+        let body = data.count > 2 ? Data(data.dropFirst(2)) : Data()  // skip [tag][len]
+
+        switch tag {
+        case 0x09:   // GetFirmwareVersion response
+            log("[read] ⟵ firmware: hex=[\(hex(data))] ascii=\"\(ascii(data))\"")
+        case 0x0D:   // GetBatteryLevel response (0x0C + 1)
+            let pct = body.first.map { Int($0) }
+            log("[read] ⟵ battery: \(pct.map { "\($0)%" } ?? "?")  raw=[\(hex(data))]")
+        case 0x19:   // GetProductInfo response — ASCII identity strings
+            log("[read] ⟵ product: hex=[\(hex(data))] ascii=\"\(ascii(data))\"")
+        case 0x11:   // GetEvent response (history) — body is a TLV record buffer
+            log("[read] ⟵ history chunk: \(data.count)B")
+            ingestRecords(body, source: "history")
+        case 0x2F:   // extended responses: feature get(0x21)/set(0x23)/subscribe(0x27)
+            // Layout: 2f <len> <sub> <id> <value…>
+            let b = [UInt8](data)
+            if b.count >= 4, b[2] == 0x28 {
+                // Live feature DATA stream (sub 0x28). Verified on worn ring:
+                //   2f 0f 28 <feat> <chan:1> 02 00 00 <value u16 LE> 00 00 00 00 <suffix:3>
+                // chan ∈ {0x09,0x19}; value oscillates ~PPG/AFE counts. (Sample rate
+                // here was ~0.5 Hz → likely an AFE stat/quality channel, not the raw
+                // high-rate PPG waveform — flagged for further investigation.)
+                let feat = b[3]
+                if b.count >= 10 {
+                    let chan = b[4]
+                    let value = UInt16(b[8]) | (UInt16(b[9]) << 8)
+                    streamSampleCount += 1
+                    log("[read] ⟵ live feat=0x\(String(format: "%02x", feat)) chan=0x\(String(format: "%02x", chan)) value=\(value)  raw=[\(hex(data))]")
+                } else {
+                    log("[read] ⟵ live feat=0x\(String(format: "%02x", feat)) (short) raw=[\(hex(data))]")
+                }
+            } else if b.count >= 4 {
+                let sub = b[2], id = b[3]
+                let val = b.count > 4 ? hex(Data(b[4...])) : ""
+                let kind = ["0x21": "feature-value", "0x23": "set-ack", "0x27": "SUBSCRIBE-ack"]["0x\(String(format: "%02x", sub))"] ?? "ext-0x\(String(format: "%02x", sub))"
+                log("[read] ⟵ \(kind) feature=0x\(String(format: "%02x", id)) value=[\(val)]  raw=[\(hex(data))]")
+            } else {
+                log("[read] ⟵ ext: hex=[\(hex(data))]")
+            }
+        case 0x1F:   // ext ack (short form) — log raw
+            log("[read] ⟵ ext: hex=[\(hex(data))]")
+        case 0x17:   // SetBleMode ack
+            log("[read] ⟵ ack SetBleMode: [\(hex(data))]")
+        case 0x13:   // SyncTime ack — body carries the ring's current ringTimestamp
+            let rt = body.count >= 4 ? UInt32(body[0]) | (UInt32(body[1])<<8) | (UInt32(body[2])<<16) | (UInt32(body[3])<<24) : 0
+            log("[read] ⟵ ack SyncTime: ringTimestamp=0x\(String(format: "%08x", rt)) raw=[\(hex(data))]")
+        case 0x1D:   // SetNotification ack
+            log("[read] ⟵ ack SetNotification: [\(hex(data))]")
+        case 0x29:   // data_flush ack
+            log("[read] ⟵ ack data_flush: [\(hex(data))]")
+        default:
+            // Unsolicited stream notification: treat the whole value as TLV records.
+            // (Some firmwares prefix a frame header; if framing fails we log raw.)
+            let before = recordCounts.values.reduce(0, +)
+            ingestRecords(data, source: "stream")
+            let after = recordCounts.values.reduce(0, +)
+            if after == before {
+                log("[read] ⟵ raw (undecoded): hex=[\(hex(data))] ascii=\"\(ascii(data))\"")
+            }
+        }
+    }
+
+    /// Append a notify buffer to the rolling stream buffer, decode whole TLV records,
+    /// log each, and keep any partial trailing bytes for the next notification.
+    func ingestRecords(_ data: Data, source: String) {
+        streamLeftover.append(data)
+        let (records, leftover) = OuraProtocol.decodeRecords(streamLeftover)
+        streamLeftover = leftover
+        for r in records {
+            recordCounts[r.type, default: 0] += 1
+            let name = OuraProtocol.recordTypeName(r.type)
+            // Type-specific human decode, validated against our own dump:
+            //  0x43 = ASCII diagnostic log line; 0x42 = time anchor (unix ts LE).
+            var extra = ""
+            if r.type == 0x43 {
+                extra = "  \"\(ascii(r.payload))\""
+            } else if r.type == 0x42, r.payload.count >= 4 {
+                let p = [UInt8](r.payload)
+                let unix = UInt32(p[0]) | (UInt32(p[1])<<8) | (UInt32(p[2])<<16) | (UInt32(p[3])<<24)
+                let date = Date(timeIntervalSince1970: TimeInterval(unix))
+                extra = "  unixAnchor=\(unix) (\(date))"
+            } else if let bio = OuraProtocol.decodeBiosignal(r) {
+                extra = "  \(bio)"
+            }
+            log(String(format: "[%@] type=0x%02x %-12@ ts=%u ses=%u ctr=%u payload(%d)=[%@]%@",
+                       source, r.type, name as NSString, r.ringTimestamp, r.session, r.counter,
+                       r.payload.count, hex(r.payload), extra))
+        }
+    }
+
+    func finishRead(_ peripheral: CBPeripheral) {
+        log("\n[read] === Stream window closed. Record summary ===")
+        if streamSampleCount > 0 {
+            log("[read]   live feature-data samples (2f/0x28): \(streamSampleCount)")
+        }
+        if recordCounts.isEmpty {
+            if streamSampleCount == 0 {
+                log("[read] (no records decoded — if the ring was on the charger, wear it and re-run.)")
+            }
+        } else {
+            for (t, c) in recordCounts.sorted(by: { $0.key < $1.key }) {
+                log("[read]   type=0x\(String(format: "%02x", t)) \(OuraProtocol.recordTypeName(t)): \(c)")
+            }
+        }
+        if !streamLeftover.isEmpty {
+            log("[read]   unframed trailing bytes: [\(hex(streamLeftover))]")
+        }
+        central.cancelPeripheralConnection(peripheral)
+        delay(1) { exit(0) }
+    }
 
     func finishTakeover(_ peripheral: CBPeripheral, success: Bool) {
         guard takeoverStep != .done else { return }
@@ -587,8 +851,12 @@ if case .selftest = mode {
 
 let explorer = Explorer(mode: mode, scanSeconds: scanSeconds)
 
-// Overall safety timeout so the process never hangs forever.
-DispatchQueue.main.asyncAfter(deadline: .now() + max(scanSeconds + 40, 60)) {
+// Overall safety timeout so the process never hangs forever. In read mode the
+// stream window itself is `seconds` long, so budget generously around it
+// (scan + connect + ~6s init + stream + grace).
+var safetyTimeout = max(scanSeconds + 40, 60)
+if case .read(_, let s, _, _) = mode { safetyTimeout = max(safetyTimeout, s + 60) }
+DispatchQueue.main.asyncAfter(deadline: .now() + safetyTimeout) {
     FileHandle.standardError.write(Data("[ble] Global timeout reached; exiting.\n".utf8))
     exit(0)
 }

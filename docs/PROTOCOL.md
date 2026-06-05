@@ -68,27 +68,61 @@ secret (a) or pure server randomness (b) is the project's go/no-go.
 
 ## Data sync model
 
-Hybrid **streaming + batch catch-up**:
+Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
+(see JOURNAL 2026-06-05): infos + ~256 TLV records decoded, no Oura app.
 
+- **Post-auth init (replayed from capture, our ring acks each):**
+  `SetBleMode 16 01 02` → `SyncTime 12 09 <unix LE> 00000000 04`
+  → `SetNotification 1c 01 bf`. Ack tags = req opcode+1 (`17`,`13`,`1d`).
+- **`data_flush` (0x28 01 00)** drains the flash buffer onto the notify stream
+  (`SetNotification` alone stays silent). But it only flushes what's ALREADY
+  buffered — it does not start measurement.
+- **Measurement trigger = feature SUBSCRIBE (ext 0x2F).** ✅ Verified on a worn
+  ring. The app runs a get/set/subscribe block before data_flush:
+  ```
+  get:        2f 02 20 <id>       → 2f 06 21 <id> <4B value>
+  set:        2f 03 22 <id> <val> → 2f 03 23 <id> <val>   (ack)
+  subscribe:  2f 03 26 <id> <val> → 2f 03 27 <id> <code>  (ack)  ← starts the stream
+  ```
+  Decisive pair: `2f 03 22 02 03` (set feat 0x02=3) then `2f 03 26 02 02`
+  (subscribe feat 0x02=2). On a worn ring this opens a **live AFE data stream**:
+  ```
+  2f 0f 28 02 <chan> 02 00 00 <value u16 LE> 00 00 00 00 59 0a 7f
+  chan ∈ {0x09,0x19}; value ≈ 5150 ±60 at rest (likely PPG DC level), ~0.5–1 Hz.
+  ```
+  ⚠️ Features 0x03/0x04/0x0b/0x0d/0x10 all ACK subscribe but only **0x02** emits
+  data. The high-rate AC PPG waveform (`0x81`) + IBI (`0x80`) did NOT stream on a
+  connected idle worn ring — likely only produced during scheduled measurement
+  sessions (sleep/spot-check). **Open question.**
 - **Live**: records as notifications, bursts ≤247 B/ATT value, latency ≤~300 ms.
-- **Batch history**: on reconnect, `GetEvent (0x10 → 0x11)` retrieves the flash
-  history by `ringTimestamp` cursor. Ack-fetch (`max_events=0`) advances the cursor
-  without data. Each sync emits `data_flush (0x28)` first.
+- **Batch history**: `GetEvent (0x10 → 0x11)` retrieves flash history by
+  `ringTimestamp` cursor. **Wire format (11 B, verified):**
+  `10 09 <cursor u32 LE> <max_events u8> <flags u32 LE = FFFFFFFF>`.
+  `cursor=0` = full dump; `max_events=0` = ack-only (advance cursor without data).
+- **Simple infos (req → resp tag = req opcode+1):** `GetFirmwareVersion 08 03 000000`
+  → `09…`; `GetBatteryLevel 0c 00` → `0d 06 <pct> …` (`0x60`=96%);
+  `GetProductInfo 18 03 <sub> 00 10` → `19 11 00 <ASCII>` (`ORE_06`, serial, …).
 - **Outer frame**: `[op:1][len:1][body]`.
-- **Inner records (TLV)**:
-  `[type:1][len:1][ctr_lo][ctr_hi][ses_lo][ses_hi][payload]`
-  with `ringTimestamp = (session<<16)|counter` (two LE u16).
-- **~40–50 record types** decoded. Notable ones:
+- **Inner records (TLV)** — ✅ decoder validated on our dump:
+  `[type:1][len:1][ctr_lo][ctr_hi][ses_lo][ses_hi][payload(len-4)]`
+  with `ringTimestamp = (session<<16)|counter` (two LE u16). `len` covers the 4
+  timestamp bytes + payload; consume `2+len` per record.
+- **~40–50 record types** total. Confirmed in OUR data marked ✅:
 
 | Type | Content |
 |------|---------|
-| `0x33` | accelerometer |
-| `0x41` | ring boot/start |
-| `0x42` | time-sync anchor (`API_TIME_SYNC_IND`) |
+| `0x33` | accelerometer (sensor = Bosch **BMA456**, per `0x43` diag log) |
+| `0x41` | ✅ ring boot/start (`… 32 02 0b …` = fw at boot) |
+| `0x42` | ✅ time-sync anchor (`API_TIME_SYNC_IND`) — payload = unix ts LE |
+| `0x43` | ✅ **diag-log: ASCII text** (`git;…`, `SNH/SNL;…`, `HWID;ORE_06`, `chgv;…`) |
 | `0x45` | state change |
+| `0x61` | ✅ binary event/counter |
 | `0x80` | green-LED IBI quality |
 | `0x81` | raw PPG (delta-encoded, stateful across reconnections) |
 | `0x85` | RTC beacon |
+
+> Not yet captured from our ring: raw biosignals (`0x80/0x81/0x33`). The pulled
+> history was system/charge events (ring just off the charger). See NEXT.md.
 
 - **Time**: ticks (~100 ms/tick default, 1 ms in burst), → UTC via `0x42`
   anchors. open_ring: `RingTimeResolver` (RE of `libappecore.so`).

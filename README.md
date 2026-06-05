@@ -11,18 +11,35 @@ data **without going through the Oura app or Oura's servers**.
 ## Status
 
 🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
-authenticated, **zero Oura app/cloud** in the auth path. Next: reading data + iOS app.
+authenticated, **zero Oura app/cloud** in the auth path.
+🟢 **Data retrieval working** — `--read` pulls device infos (battery/firmware/
+product), decodes the ring's TLV record stream/history, AND triggers a **live AFE
+data stream from the worn ring** (feature subscribe). High-rate PPG waveform / IBI
+still TODO. Next: scheduled-measurement PPG + iOS app.
 
 ## Goals
 
-### Current goal (the challenge) — ✅ DONE
+### Core challenge — ✅ DONE
 **Pair with the ring and authenticate without the official Oura app, from scratch.**
 Achieved: after a factory reset, our macOS tool sets its own `auth_key` on the ring
 and authenticates. The official Oura app can no longer reclaim the ring (it enters
 "restricted mode") until a factory reset — proving the takeover holds.
 
+### Data retrieval — ✅ DONE (infos + records); biosignals in progress
+`--read` (saved-key handshake → read) verified on the real ring:
+- **Battery 96%**, **firmware 2.0.0.2.11**, **product** `ORE_06` / serial
+  `2016092441019131` — all read directly, no Oura app.
+- **TLV records decoded** (~256 in one history dump): boot (`0x41`), time-anchor
+  (`0x42`, unix ts), **ASCII diag logs** (`0x43`: `git;…`, `HWID;ORE_06`,
+  `acm_bma456`…), events (`0x61`). Decoder validated on our own data.
+- **Live AFE stream** from the worn ring via feature subscribe (`2f 03 26 02 02`):
+  channel 0x09 value ≈ 5150 (likely PPG DC level), reacts to finger movement.
+- ⏳ **High-rate PPG waveform** (`0x81`) + **IBI** (`0x80`) not yet streamed — only
+  feature 0x02 emits, and it's the slow AFE channel. Likely needs a scheduled
+  measurement session. See `docs/NEXT.md`.
+
 ### Next
-- Read real data over BLE (battery, firmware, then HR/IBI/temp/accel/PPG records).
+- Capture raw biosignals (wear ring, investigate measurement-start). 
 - Port to a native iOS app (Swift / CoreBluetooth), reusing `OuraProtocol.swift`.
   Clean-room: `open_ring`/`ringverse` used only as reference docs, not as a codebase.
 
@@ -53,6 +70,10 @@ cd ble-explorer && swift build
 .build/debug/ble-explorer --oura               # find + connect the ring, dump GATT
 .build/debug/ble-explorer --takeover           # set OUR key on a FACTORY-RESET ring (pairing mode)
 .build/debug/ble-explorer --auth [hexkey]      # authenticate (key from arg or Keychain)
+.build/debug/ble-explorer --read [hexkey]      # auth → infos → subscribe feat 0x02 → live AFE stream
+.build/debug/ble-explorer --read --history     # also dump buffered flash history (GetEvent)
+.build/debug/ble-explorer --read --seconds 30  # keep the live-stream window open for 30s
+.build/debug/ble-explorer --read --features 02,03,0b  # probe other feature IDs for PPG/IBI
 .build/debug/ble-explorer --reset [hexkey]     # authenticate then factory-reset (give ring back)
 .build/debug/ble-explorer --store-key <hexkey> # save a key into the macOS Keychain
 ```
