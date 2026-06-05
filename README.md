@@ -85,6 +85,7 @@ cd ble-explorer && swift build
 .build/debug/ble-explorer --read --seconds 30  # keep the live-stream window open for 30s
 .build/debug/ble-explorer --read --cursor recent      # fetch RECENT records → HR/HRV/temp/accel biosignals
 .build/debug/ble-explorer --read --drain --seconds 60 # repeated GetEvent (drain records as the ring measures)
+.build/debug/ble-explorer --read --burst --seconds 50 # keep DHR HR-burst engaged (attempt raw PPG 0x81)
 .build/debug/ble-explorer --read --features 02,03,0b  # probe other feature IDs
 .build/debug/ble-explorer --reset [hexkey]     # authenticate then factory-reset (give ring back)
 .build/debug/ble-explorer --store-key <hexkey> # save a key into the macOS Keychain

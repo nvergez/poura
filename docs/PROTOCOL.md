@@ -138,11 +138,22 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
 | `0x82`/`0x83` | ✅ scan-start / scan-end |
 | `0x85` | RTC beacon (unix ts LE u32 + trailer) |
 
-> **0x81 raw PPG** is the only signal not retrieved from our ring: it is NOT in the
-> retrievable event log (the ring derives IBI on-device and discards the raw
-> waveform). The app capture caught 0x81 live during an active measurement burst
-> (session 5392). Everything that derives from PPG — HR, HRV, IBI — already works.
-> Heart rate cross-validated vs the user's Fitbit (60–67 bpm).
+> **0x81 raw PPG** is the only signal not retrieved from our ring. We replayed
+> open_ring's §6.7 DHR-burst trigger (`set 0x02=0x03` + `subscribe 0x02=0x02`,
+> re-sent every ~12 s since the ring auto-reverts after ~20 s). The ring's own diag
+> log **confirms `DHR_mode:3`** (burst active), yet 0x81 is still never emitted over
+> BLE. → firmware/hardware boundary on this variant (oreo / ORE_06, fw 2.0.0.2.11),
+> not a missing command. Everything derived from PPG — HR, HRV, IBI — works; HR
+> cross-validated vs the user's Fitbit (60–67 bpm).
+
+### Real-time stream vs open_ring
+open_ring confirms our auth, GetEvent/cursor, feature IDs (0x02=DHR, 0x03/04/0b
+toggles) and record types. **Beyond open_ring**: we observe a *continuous* ~2 Hz
+`2f/0x28` optical-AFE push stream (multi-channel: chan 0x01/09/11/19) that reacts to
+movement in real time (the onboarding "wave test"). open_ring models `0x28` only as a
+one-shot "param push notification after a write", and does not document the `0x27`
+subscribe-ack or the per-LED optical channels. Our stream characterization is a
+finding beyond the public spec.
 
 - **Time**: ticks (~100 ms/tick default, 1 ms in burst), → UTC via `0x42`
   anchors. open_ring: `RingTimeResolver` (RE of `libappecore.so`).

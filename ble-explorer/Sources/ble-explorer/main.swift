@@ -37,6 +37,12 @@ var historyCursorSpec: String? = nil
 // instead of a single start-of-session fetch.
 var drainMode = false
 
+// `--burst`: keep the DHR (feature 0x02) "burst" HR mode engaged. open_ring §6.7:
+// the ring auto-reverts to mode 0 after ~20 s, so the app re-triggers every ~15 s.
+// We re-send `set 0x02=0x03` + `subscribe 0x02=0x02` every ~12 s to keep the raw
+// PPG (0x81) burst flowing, and GetEvent-drain it.
+var burstMode = false
+
 let ouraServiceUUID = CBUUID(string: "98ed0001-a541-11e4-b6a0-0002a5d5c51b")
 let ouraWriteCharUUID = CBUUID(string: "98ed0002-a541-11e4-b6a0-0002a5d5c51b")
 let ouraNotifyCharUUID = CBUUID(string: "98ed0003-a541-11e4-b6a0-0002a5d5c51b")
@@ -104,6 +110,10 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
         case "--drain":
             // Repeatedly GetEvent at the advancing cursor during the stream window.
             drainMode = true; readHistory = true
+            if historyCursorSpec == nil { historyCursorSpec = "recent" }
+        case "--burst":
+            // Keep DHR burst HR mode engaged + drain, to capture raw PPG (0x81).
+            burstMode = true; drainMode = true; readHistory = true
             if historyCursorSpec == nil { historyCursorSpec = "recent" }
         case "--features":
             // Comma/space-separated hex feature IDs to subscribe, e.g. "02,03,0b".
@@ -659,6 +669,20 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let streamStart = afterInfo + (readWantsHistory ? 1.0 : 0.4)
         delay(streamStart) {
             self.log("\n[read] === LIVE STREAM open for \(Int(self.readStreamSeconds))s — wear the ring, keep still for clean PPG/IBI ===")
+        }
+
+        // --burst: re-engage the DHR burst HR mode every ~12 s (ring auto-reverts to
+        // mode 0 after ~20 s). This is what makes the ring emit the raw PPG (0x81).
+        if burstMode {
+            var t = streamStart + 0.2
+            while t < streamStart + readStreamSeconds {
+                delay(t) {
+                    self.log("[read] → DHR burst re-trigger (set 0x02=0x03, subscribe 0x02=0x02)…")
+                    self.write(OuraProtocol.featureSet(0x02, 0x03), label: "read")
+                }
+                delay(t + 0.3) { self.write(OuraProtocol.featureSubscribe(0x02, 0x02), label: "read") }
+                t += 12.0
+            }
         }
 
         // --drain: every ~2.5 s, re-issue GetEvent from the latest ringTimestamp seen,

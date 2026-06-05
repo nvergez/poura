@@ -622,3 +622,78 @@ explore whether a feature/command forces continuous raw-PPG emission.
 ### Files
 - `main.swift`: `--drain` (repeated advancing-cursor GetEvent); track `latestSeenTs`.
 - Local capture (git-ignored): `captures/poura-drain-attempt.log`.
+
+---
+
+## 2026-06-05g — Real-time stream characterized (the onboarding "wave test")
+
+User recalled the Oura onboarding "wave your hand" step where an on-screen animation
+follows the hand in REAL TIME — proof the ring pushes live motion-reactive data.
+Investigated which feature/channel that is.
+
+### Experiment
+`--read --features 02,03,04,0b,0d,10` while the user waved their hand 30 s.
+- Only **feature 0x02** emits a live push stream (`2f 0f 28 02 <chan> 02 00 00
+  <value u16 LE> 00 00 00 00 <suffix3>`), ~2 Hz (faster than the ~1 Hz at rest).
+- Features 0x03/0x04/0x0b/0x0d/0x10 ACK subscribe (`2f 03 27 <id> 02`) but push
+  NOTHING and produce no records. → 0x02 is THE data-plane feature; others are
+  toggles/sub-options without their own stream.
+
+### The stream reacts to movement (confirmed)
+Channel value at rest ≈ 5150 (±60). While waving: values swing 4985→13327
+(amplitude ~8300, ~140× the resting variation), saturating at ~10192/13279 then
+dropping back when still. This is exactly the onboarding "wave" behaviour.
+
+Sub-channels seen (chan byte): 0x01, 0x09, 0x11, 0x19 — all swing ~1300→13300 with a
+recurring ~13300 saturation ceiling. → these are **AFE optical channels** (different
+LEDs / photodiodes); `chan` selects which. Single scalar u16 per sample (no XYZ).
+
+### Conclusion (honest)
+The real-time stream is the **multi-channel optical AFE intensity** (the raw light
+level the PPG is derived from), ~2 Hz, push, movement-reactive. It is NOT the 3-axis
+accelerometer (single scalar per sample, no axes) nor the pure high-rate PPG waveform
+(0x81, derived on-device, not exposed — see 2026-06-05f). The onboarding wave
+animation most plausibly rides this optical stream (movement saturates it) and/or an
+accel stream we could not trigger.
+
+So we DO have a genuine real-time channel (not just fast history catch-up); it's the
+optical AFE feed. Per-channel optical intensity is itself useful (presence/wear,
+crude motion, perfusion). Local capture: `captures/poura-wave-test.log`.
+
+---
+
+## 2026-06-05h — DHR burst trigger (open_ring §6.7) — ring confirms mode 3, still no 0x81
+
+### open_ring cross-check (verified against the source)
+Fetched open_ring PROTOCOL.md and compared to our findings:
+- **Confirms**: feature 0x02 = `PARAM_DHR` (Daytime Heart Rate, byte0=mode); features
+  0x03=ActivityHR, 0x04=SpO2, 0x0b=ActivityHR-aux are toggles; GetEvent cursor
+  semantics ("rt > cursor; 0 = full dump"); IBI/temp record types.
+- **Beyond open_ring (our findings)**: the continuous ~2 Hz `2f/0x28` optical AFE
+  stream (open_ring calls 0x28 just a "param push notification after a write", not a
+  stream); the `0x27` subscribe-ack; per-LED optical channels 0x01/09/11/19.
+- **Key lead**: open_ring §6.7 says raw PPG (0x81) "bursts during HR mode", DHR mode
+  values `0=off,1=on,3=burst-3,4=burst-4`, and **"the ring auto-reverts to mode 0
+  after ~20 s; the phone re-triggers every ~15 s"**. We only triggered once → the
+  burst lapsed before 0x81 could flow.
+
+### Implemented + tested `--burst`
+Re-engages DHR burst every ~12 s (`set 0x02=0x03` + `subscribe 0x02=0x02`) + drains.
+`--read --burst --seconds 50`, worn + still, 5 re-triggers.
+
+Result: **the ring's OWN diagnostic log confirms it entered the mode** —
+`0x43` diag strings `DHR_mode:3` and `DHR data sub` appear repeatedly after each
+re-trigger. So the burst command is accepted and active. **But 0x81 still never
+emitted** (0 records); only the usual IBI 0x80 / temp / accel / debug streamed.
+
+### Conclusion (now well-supported)
+On THIS ring — Ring 4 "oreo" / ORE_06, firmware 2.0.0.2.11 — the raw PPG waveform
+(0x81) is **not emitted over the BLE event channel even in confirmed DHR burst mode**.
+We replayed open_ring's exact §6.7 sequence, the ring acknowledges and logs
+`DHR_mode:3`, yet no 0x81. open_ring documents 0x81 for the rings they studied; our
+variant/firmware diverges here. This is a firmware/hardware capability boundary, not
+a missing command on our side — and it's now backed by the ring's own mode-3 log.
+
+Everything derived from PPG — HR, HRV, IBI — is retrieved and decoded regardless.
+
+Local capture (git-ignored): `captures/poura-dhr-burst.log`.
