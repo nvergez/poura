@@ -20,6 +20,7 @@
 
 import Foundation
 import CoreBluetooth
+import PouraCore   // shared protocol (OuraProtocol, OuraOpcode) + Keychain
 
 // Force line-buffered / immediate flush so output is visible even when stdout is
 // redirected to a file (otherwise libc block-buffers and we see nothing live).

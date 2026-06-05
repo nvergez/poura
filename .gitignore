@@ -31,6 +31,15 @@ DerivedData/
 ble-explorer/.build/
 captures/*bugreport*
 
+# Shared PouraCore package (used by both ble-explorer and ios-app)
+PouraCore/.build/
+PouraCore/.build-ios/
+
+# iOS app: the .xcodeproj AND Info.plist are generated from ios-app/project.yml by XcodeGen.
+ios-app/*.xcodeproj
+ios-app/PouraApp/PouraApp/Info.plist
+ios-app/.build-xcode/
+
 # Local-only RE artifacts and large/generated outputs — keep out of the repo.
 research/jadx-out/
 research/*decompile*.log

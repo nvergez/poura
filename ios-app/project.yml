@@ -1,0 +1,40 @@
+# XcodeGen spec for the poura iOS app.
+#
+# Generate the .xcodeproj with:  brew install xcodegen && cd ios-app && xcodegen
+# Then open PouraApp.xcodeproj in Xcode, pick your team/signing, and run on a real
+# iPhone (the Simulator has NO Bluetooth — BLE never powers on there).
+#
+# If you'd rather not use XcodeGen, see README.md → "Manual Xcode setup".
+name: PouraApp
+options:
+  bundleIdPrefix: com.poura
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  PouraCore:
+    path: ../PouraCore   # shared library at the repo root (sibling of ios-app/)
+
+targets:
+  PouraApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: PouraApp/PouraApp
+    dependencies:
+      - package: PouraCore
+    info:
+      path: PouraApp/PouraApp/Info.plist
+      properties:
+        CFBundleDisplayName: poura
+        UILaunchScreen: {}
+        # REQUIRED: iOS kills the app on first CBCentralManager use without this string.
+        NSBluetoothAlwaysUsageDescription: >-
+          poura connects to your own Oura Ring 4 over Bluetooth to read its
+          biosignals directly, without the Oura app or cloud.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.poura.app
+        TARGETED_DEVICE_FAMILY: "1"  # iPhone
+        SWIFT_VERSION: "5.9"
