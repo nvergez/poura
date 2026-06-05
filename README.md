@@ -12,10 +12,11 @@ data **without going through the Oura app or Oura's servers**.
 
 🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
 authenticated, **zero Oura app/cloud** in the auth path.
-🟢 **Data retrieval working** — `--read` pulls device infos (battery/firmware/
-product), decodes the ring's TLV record stream/history, AND triggers a **live AFE
-data stream from the worn ring** (feature subscribe). High-rate PPG waveform / IBI
-still TODO. Next: scheduled-measurement PPG + iOS app.
+🟢 **Data + biosignals retrieved** — `--read` pulls device infos, decodes the TLV
+record stream/history, and `--read --cursor recent` retrieves **real physiological
+records from the worn ring**: IBI/heart-beat (0x80/0x60), temperature (0x46,
+decoded: ~25.8°C skin), motion (0x47). All without the Oura app. Remaining: validate
+IBI bit-packing + capture raw PPG (0x81), then iOS app.
 
 ## Goals
 
@@ -73,6 +74,7 @@ cd ble-explorer && swift build
 .build/debug/ble-explorer --read [hexkey]      # auth → infos → subscribe feat 0x02 → live AFE stream
 .build/debug/ble-explorer --read --history     # also dump buffered flash history (GetEvent)
 .build/debug/ble-explorer --read --seconds 30  # keep the live-stream window open for 30s
+.build/debug/ble-explorer --read --cursor recent      # fetch RECENT records → IBI/temp/motion biosignals
 .build/debug/ble-explorer --read --features 02,03,0b  # probe other feature IDs for PPG/IBI
 .build/debug/ble-explorer --reset [hexkey]     # authenticate then factory-reset (give ring back)
 .build/debug/ble-explorer --store-key <hexkey> # save a key into the macOS Keychain

@@ -264,20 +264,19 @@ enum OuraProtocol {
             guard p.count >= 6 else { return nil }
             func t(_ i: Int) -> Double { Double(Int16(bitPattern: UInt16(p[i]) | (UInt16(p[i+1]) << 8))) / 100.0 }
             return String(format: "temp=[%.2f, %.2f, %.2f]°C", t(0), t(2), t(4))
-        case 0x80:   // green-LED IBI quality
+        case 0x80:   // green-LED IBI quality — 7× u16 LE. The exact bit packing of
+            // IBI-ms vs quality is NOT yet validated against ground truth (the
+            // bits-0..10 split produces incoherent intervals on real data), so we
+            // print the raw u16 words rather than asserting wrong "ms" values.
             guard p.count >= 2 else { return nil }
-            var beats: [String] = []
+            var words: [String] = []
             var i = 0
             while i + 1 < p.count {
                 let w = UInt16(p[i]) | (UInt16(p[i+1]) << 8)
-                let ibi = w & 0x07FF              // bits 0-10
-                let qa = (w >> 11) & 0x07         // bits 11-13
-                let qb = (w >> 14) & 0x03         // bits 14-15
-                let clean = (qa <= 1 && qb == 0) ? "" : "?"
-                beats.append("\(ibi)ms\(clean)")
+                words.append(String(format: "0x%04x", w))
                 i += 2
             }
-            return "IBI=[\(beats.joined(separator: " "))]  (? = low quality)"
+            return "IBI-words(u16 LE, packing TBD)=[\(words.joined(separator: " "))]"
         default:
             return nil
         }

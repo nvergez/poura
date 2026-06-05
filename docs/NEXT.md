@@ -31,11 +31,26 @@ data stream from the worn ring. The ring currently trusts OUR key.
   0x42 time-anchor (unix ts), 0x43 ASCII diag, 0x61 events. Decoders ready for
   0x46 temp + 0x80 IBI-quality (not yet seen live).
 
-## Next task: get the HIGH-RATE PPG WAVEFORM (0x81) + IBI (0x80)
+## ✅ SOLVED: biosignals come from GetEvent with a RECENT cursor (not the live stream)
 
-Feature 0x02 streams only a slow AFE channel (~1 Hz, likely PPG DC). The AC PPG
-waveform + beat intervals did NOT appear on a connected idle worn ring. Probed
-features 0x02/03/04/0b/0d/10 — all ACK subscribe, only 0x02 emits. Leads to chase:
+`--read --cursor recent` retrieves real worn-ring records: IBI (0x80/0x60), temp
+(0x46, decoded ✅), motion (0x47). The earlier "feature subscribe stream" only gives
+a slow AFE channel; the actual PPG/IBI data is in the flash event log and you fetch
+it with `GetEvent` from a cursor near the ring's CURRENT ringTimestamp (cursor 0 only
+replays the old boot/charge log). `--cursor recent` reads ring-now from the SyncTime
+ack and fetches from there.
+
+## Next task: decode IBI/PPG payloads + capture 0x81
+
+- **0x80 IBI packing** is NOT validated — bits-0..10 give incoherent ms. Currently
+  printed as raw u16 words. Validate against a known heart rate (count your pulse for
+  15 s during a run) or open_ring `decoders.py` L417/L646. Same for 0x60.
+- **0x81 raw PPG** (delta-encoded) didn't appear in a short window — do a longer
+  `--read --cursor recent --seconds 30` (or a couple of runs) to catch it, then write
+  the stateful delta decoder (0x80 marker → 3-byte abs u24; MSB-set = signed delta).
+- Optional older leads (the live-stream path, lower priority now):
+  Feature 0x02 streams only a slow AFE channel (~1 Hz). Probed features
+  0x02/03/04/0b/0d/10 — all ACK subscribe, only 0x02 emits. If you revisit:
 - **Scheduled measurement hypothesis**: the ring may only run high-rate PPG during
   sleep / spot-check sessions, not over an active BLE link (power). Try: subscribe,
   then **disconnect and let the ring measure**, reconnect later and `--history` to

@@ -28,6 +28,10 @@ setbuf(stdout, nil)
 // Oura Ring 4 GATT identifiers — CONFIRMED against the real ring + btsnoop capture.
 // Service 98ED0001; write commands → 98ED0002 (handle 0x0015), responses notify on
 // 98ED0003 (handle 0x0012).
+// History cursor spec from `--cursor` (nil = full dump from 0). Read by the read
+// sequence; a global keeps it out of the already-wide Mode enum.
+var historyCursorSpec: String? = nil
+
 let ouraServiceUUID = CBUUID(string: "98ed0001-a541-11e4-b6a0-0002a5d5c51b")
 let ouraWriteCharUUID = CBUUID(string: "98ed0002-a541-11e4-b6a0-0002a5d5c51b")
 let ouraNotifyCharUUID = CBUUID(string: "98ed0003-a541-11e4-b6a0-0002a5d5c51b")
@@ -87,6 +91,11 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
             }
         case "--history":
             readHistory = true
+        case "--cursor":
+            // "0" (default), "recent" (ring-now minus a window), or an explicit hex.
+            if i + 1 < args.count {
+                historyCursorSpec = args[i + 1]; readHistory = true; i += 1
+            }
         case "--features":
             // Comma/space-separated hex feature IDs to subscribe, e.g. "02,03,0b".
             if i + 1 < args.count {
@@ -204,6 +213,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var streamLeftover = Data()    // bytes from a previous notify that didn't frame a full record
     var recordCounts: [UInt8: Int] = [:]  // per-type tally for the end-of-run summary
     var streamSampleCount = 0      // live feature-data samples (2f/0x28) seen this run
+    var ringNowTimestamp: UInt32 = 0  // ring's current ringTimestamp, from the SyncTime ack
     var readStreamSeconds: Double { if case .read(_, let s, _, _) = mode { return s } else { return 20 } }
     var readWantsHistory: Bool { if case .read(_, _, let h, _) = mode { return h } else { return false } }
     var readFeatureIDs: [UInt8] { if case .read(_, _, _, let f) = mode { return f } else { return [0x02] } }
@@ -620,11 +630,18 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             self.write(OuraProtocol.dataFlush(), label: "read")
         }
 
-        // Optional explicit history dump from cursor 0 (full flash history).
+        // Optional explicit history dump. Cursor strategy (learned from the capture:
+        // the app's biosignal records arrived via GetEvent with a RECENT cursor, not
+        // cursor 0 which only replays the old boot/charge log):
+        //  - default: cursor 0 (full dump)
+        //  - `--cursor recent`: use the ring's current ringTimestamp (from SyncTime
+        //    ack) minus a window, so we fetch only the most recent records.
+        //  - `--cursor <hex>`: explicit cursor.
         if readWantsHistory {
             delay(afterInfo + 0.5) {
-                self.log("[read] → GetEvent (0x10) full history fetch from cursor 0…")
-                self.write(OuraProtocol.getEvent(cursor: 0), label: "read")
+                let cur = self.resolveHistoryCursor()
+                self.log("[read] → GetEvent (0x10) history fetch from cursor 0x\(String(format: "%08x", cur))…")
+                self.write(OuraProtocol.getEvent(cursor: cur), label: "read")
             }
         }
 
@@ -636,6 +653,22 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         delay(streamStart + readStreamSeconds) {
             self.finishRead(peripheral)
         }
+    }
+
+    /// Decide which ringTimestamp cursor to pass to GetEvent, from `--cursor`:
+    ///  - nil / "0"  → 0 (full dump)
+    ///  - "recent"   → ring's current ringTimestamp minus a window (recent records)
+    ///  - "<hex>"    → that explicit value
+    func resolveHistoryCursor() -> UInt32 {
+        guard let spec = historyCursorSpec else { return 0 }
+        if spec == "recent" {
+            // Window back from "now" so we catch recent measurement records but not
+            // the whole boot/charge log. 0x2000 counter-ticks ≈ a few minutes.
+            let window: UInt32 = 0x2000
+            return ringNowTimestamp > window ? ringNowTimestamp - window : 0
+        }
+        if let v = UInt32(spec.replacingOccurrences(of: "0x", with: ""), radix: 16) { return v }
+        return 0
     }
 
     /// Schedule a closure on the main queue after `s` seconds (thin wrapper for
@@ -694,6 +727,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             log("[read] ⟵ ack SetBleMode: [\(hex(data))]")
         case 0x13:   // SyncTime ack — body carries the ring's current ringTimestamp
             let rt = body.count >= 4 ? UInt32(body[0]) | (UInt32(body[1])<<8) | (UInt32(body[2])<<16) | (UInt32(body[3])<<24) : 0
+            ringNowTimestamp = rt
             log("[read] ⟵ ack SyncTime: ringTimestamp=0x\(String(format: "%08x", rt)) raw=[\(hex(data))]")
         case 0x1D:   // SetNotification ack
             log("[read] ⟵ ack SetNotification: [\(hex(data))]")

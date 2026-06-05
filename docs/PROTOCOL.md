@@ -91,9 +91,15 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
   chan ∈ {0x09,0x19}; value ≈ 5150 ±60 at rest (likely PPG DC level), ~0.5–1 Hz.
   ```
   ⚠️ Features 0x03/0x04/0x0b/0x0d/0x10 all ACK subscribe but only **0x02** emits
-  data. The high-rate AC PPG waveform (`0x81`) + IBI (`0x80`) did NOT stream on a
-  connected idle worn ring — likely only produced during scheduled measurement
-  sessions (sleep/spot-check). **Open question.**
+  data (a slow ~1 Hz AFE channel).
+- **✅ Biosignals come from `GetEvent` with a RECENT cursor, not the live stream.**
+  The app's PPG/IBI/temp records (capture: 0x81×108, 0x80×47, 0x60×41, 0x46×90)
+  arrived as the response to `GetEvent` with a cursor near the ring's CURRENT
+  ringTimestamp (`10 09 <recent cursor> 00 ffffffff`). Cursor 0 only replays the
+  old boot/charge log. Our `--read --cursor recent` reads ring-now from the SyncTime
+  ack and fetches recent records → on the worn ring this returns IBI (0x80/0x60),
+  temp (0x46, decoded `[25.8, 28.0, 21.4]°C`), motion (0x47). IBI bit-packing +
+  0x81 PPG delta decode still TODO.
 - **Live**: records as notifications, bursts ≤247 B/ATT value, latency ≤~300 ms.
 - **Batch history**: `GetEvent (0x10 → 0x11)` retrieves flash history by
   `ringTimestamp` cursor. **Wire format (11 B, verified):**

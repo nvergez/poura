@@ -444,3 +444,55 @@ decoded the capture; we kept only byte-verified claims):
   `0x2F/0x28` stream decoder (chan + value); `--features <hex,…>` flag;
   `streamSampleCount` in the summary.
 - Local captures (git-ignored): `poura-live-worn-stream.log`, `poura-feature-probe.log`.
+
+---
+
+## 2026-06-05c — 🎉 BIOSIGNALS RETRIEVED (IBI, temp, motion) via recent-cursor GetEvent
+
+Got real physiological data off the worn ring, no Oura app. The unlock was the
+**GetEvent cursor**, not a stream subscribe.
+
+### The real mechanism (corrects 2026-06-05b)
+Re-decoded the onboarding capture: the app's biosignal records (108× 0x81 PPG,
+47× 0x80 IBI, 41× 0x60, 90× 0x46 temp) arrived as the **response to a GetEvent
+(0x10) with a RECENT cursor** (`10 09 98e50f15 00 ffffffff`, cursor 0x150fe598) —
+NOT from the feature-subscribe live stream. Our `--history` used `cursor=0`, which
+only replays the oldest flash pages (boot/charge log), so we never reached the
+recent measurement records.
+
+Confirmed the app's own capture DID contain biosignals (sub-agent TLV walk over the
+whole btsnoop): 0x81×108, 0x80×47, 0x60×41, 0x46×90. So the data was always there;
+we were fetching from the wrong cursor.
+
+### Fix + result
+Added `--cursor recent|<hex>`: `recent` reads the ring's current ringTimestamp from
+the SyncTime ack, subtracts a small window (~0x2000 ticks), and fetches from there.
+
+`--read --cursor recent` on the worn ring returned (one 12 s run):
+- **0x80 IBI-quality × 42**, **0x60 IBI+amp × 47** (heart-rate data)
+- **0x46 temperature × 11** — decoded cleanly: `[25.8, 28.0, 21.4]°C` (skin / internal
+  / ambient), stable and physiologically plausible. ✅
+- **0x47 motion × 11**, plus 0x42 anchor, 0x45 state, 0x5b/0x5d/0x6c/0x72/0x82/0x83.
+
+Our ring's ringTimestamps are session=5 (a lightly-used ring), e.g. ts≈387060;
+cursor `recent` resolves to ~0x5e000 and lands right on the live measurement records.
+
+### Honest status on decoding
+- **Temp (0x46)** decode VERIFIED (3× i16 LE /100 °C).
+- **IBI (0x80)** records are framed correctly but the **bit-packing of IBI-ms vs
+  quality is NOT yet validated** — the bits-0..10 split gives incoherent intervals
+  (jumps 100↔1900 ms). Changed the decoder to print raw u16 words (`packing TBD`)
+  rather than assert wrong "ms". Same for 0x60 (dense 14-byte payload, undecoded).
+- **0x81 raw PPG** did not appear in this short window (it's the highest-volume type
+  in the app capture; expect it in a longer/again run). Decoder still TODO
+  (delta-encoded, stateful).
+
+### Files
+- `OuraProtocol.swift`: 0x80 decoder now prints raw u16 words (honest, packing TBD).
+- `main.swift`: `--cursor recent|<hex>`; capture ring-now ringTimestamp from SyncTime
+  ack; `resolveHistoryCursor()`.
+- Local capture (git-ignored): `captures/poura-biosignals-recent.log`.
+
+### Next
+Decode 0x80/0x60 IBI packing (validate against a known HR, or open_ring decoders.py
+L231/L417), and capture 0x81 raw PPG in a longer recent-cursor pull. Then HR/HRV.
