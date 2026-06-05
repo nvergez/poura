@@ -33,7 +33,18 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showKeySheet) {
                 KeySheet(savedKeyHex: $savedKeyHex, onSignedOut: onSignedOut)
+                    .environmentObject(ring)
             }
+        }
+        .onChange(of: ring.factoryResetSucceeded) { succeeded in
+            // The ring was erased over BLE — the saved key no longer authenticates to
+            // anything, so drop it and return to onboarding. Done here (not in KeySheet)
+            // because the sheet has already dismissed by the time the async reset lands.
+            guard succeeded else { return }
+            Keychain.deleteAuthKey()
+            savedKeyHex = ""
+            ring.acknowledgeFactoryReset()
+            onSignedOut()
         }
     }
 
@@ -231,11 +242,24 @@ struct ContentView: View {
     }
 }
 
-/// View / export / forget the auth key. Deleting it signs out → back to onboarding.
+/// View / export the auth key, or factory-reset the ring (which also signs out).
 struct KeySheet: View {
+    @EnvironmentObject var ring: RingManager
     @Binding var savedKeyHex: String
     var onSignedOut: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmingReset = false
+
+    private var canReset: Bool {
+        Data(hexString: savedKeyHex)?.count == 16 && !isBusy
+    }
+
+    private var isBusy: Bool {
+        switch ring.phase {
+        case .idle, .done, .bluetoothUnavailable: return false
+        default: return true
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -248,18 +272,32 @@ struct KeySheet: View {
                     Text("The 16-byte key this phone uses to authenticate to the ring. Stored device-only (not iCloud-synced). Back it up — it's your only way to re-pair without a factory reset.")
                 }
                 Section {
-                    Button("Forget ring & key", role: .destructive) {
-                        Keychain.deleteAuthKey()
-                        savedKeyHex = ""
-                        dismiss()
-                        onSignedOut()
+                    Button("Factory reset", role: .destructive) {
+                        confirmingReset = true
                     }
+                    .disabled(!canReset)
                 } footer: {
-                    Text("Removes the key from this phone and returns to onboarding. The ring stays claimed by this key until you factory-reset it — keep the key if you want to re-pair.")
+                    Text("Authenticates with this key, then erases the ring's memory over Bluetooth so it returns to pairing mode — re-onboard it here or in the Oura app. This also removes the key from this phone. The ring must be off the charger and in range.")
                 }
             }
             .navigationTitle("Key")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .confirmationDialog("Factory reset the ring?", isPresented: $confirmingReset, titleVisibility: .visible) {
+                Button("Factory reset", role: .destructive) { startFactoryReset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This erases all data on the ring and unpairs it from this phone. It can't be undone. You'll need to onboard the ring again to use it.")
+            }
         }
+    }
+
+    /// Kick off the BLE factory reset, then dismiss so the user watches progress on the
+    /// main screen. The key is deleted + sign-out happens only AFTER the reset succeeds
+    /// (ContentView observes `ring.factoryResetSucceeded`) — never before, so a failed
+    /// reset leaves the key intact for a retry instead of stranding the user.
+    private func startFactoryReset() {
+        guard let key = Data(hexString: savedKeyHex), key.count == 16 else { return }
+        ring.start(.factoryReset(key))
+        dismiss()
     }
 }

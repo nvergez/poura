@@ -30,6 +30,7 @@ enum RingOperation: Equatable {
     case takeover               // set OUR key on a factory-reset ring (pairing mode)
     case authenticate(Data)     // re-auth with a saved 16-byte key
     case read(Data)             // auth then run the read sequence (worn ring)
+    case factoryReset(Data)     // auth with our key, then ResetMemory (give the ring back)
 }
 
 /// Coarse lifecycle state for the UI to switch on.
@@ -145,6 +146,11 @@ final class RingManager: NSObject, ObservableObject {
     /// fresh measurement records or replaying the old charge/boot log.
     @Published private(set) var diag = ReadDiagnostics()
 
+    /// Flips true once a factory-reset op completes successfully. The main view watches
+    /// this to delete the now-defunct local key and return to onboarding. The UI must
+    /// call `acknowledgeFactoryReset()` after handling it so it doesn't re-fire.
+    @Published private(set) var factoryResetSucceeded = false
+
     /// True if a 16-byte key is already stored — the app skips onboarding when so.
     var hasSavedKey: Bool { Keychain.loadAuthKey()?.count == 16 }
 
@@ -175,6 +181,8 @@ final class RingManager: NSObject, ObservableObject {
     private enum Step { case idle, notifyEnabled, sentSetAuthKey, sentNonce, sentAuth, reading, done }
     private var step: Step = .idle
     private var readPhase = false
+    private var resetSent = false           // ResetMemory written; waiting for the 0x1B ack
+    private var resetGraceWork: DispatchWorkItem?
     private var streamLeftover = Data()
     private var ringNowTimestamp: UInt32 = 0
     private var latestSeenTs: UInt32 = 0
@@ -198,6 +206,10 @@ final class RingManager: NSObject, ObservableObject {
         }
         if case .authenticate(let k) = op { authKey = k }
         if case .read(let k) = op { authKey = k }
+        if case .factoryReset(let k) = op {
+            authKey = k
+            info("⚠️ Factory reset: will authenticate with this phone's key, then erase the ring's memory so it can be re-onboarded fresh.")
+        }
 
         switch central.state {
         case .poweredOn: beginScan()
@@ -257,6 +269,9 @@ final class RingManager: NSObject, ObservableObject {
         step = .idle; readPhase = false; streamLeftover = Data()
         ringNowTimestamp = 0; latestSeenTs = 0; allIBIms = []
         isOnboarding = false
+        resetSent = false
+        factoryResetSucceeded = false
+        resetGraceWork?.cancel(); resetGraceWork = nil
         // NB: don't reset onboardingStep here — the wizard view keeps showing the last
         // outcome (.succeeded/.failed) until the user acts. startOnboarding() sets it.
     }
@@ -489,7 +504,7 @@ extension RingManager: CBPeripheralDelegate {
             info("Notifications on. Setting OUR auth_key…")
             step = .sentSetAuthKey
             write(OuraProtocol.setAuthKey(authKey))
-        case .authenticate, .read:
+        case .authenticate, .read, .factoryReset:
             info("Authenticating with saved key…")
             step = .sentNonce
             write(OuraProtocol.getAuthNonce())
@@ -544,6 +559,7 @@ extension RingManager: CBPeripheralDelegate {
             logSuccess("Authenticated with our key.")
             switch operation {
             case .read: startReadSequence()
+            case .factoryReset: startFactoryReset()
             case .takeover:
                 let stored = Keychain.storeAuthKey(authKey)
                 if isOnboarding {
@@ -562,7 +578,10 @@ extension RingManager: CBPeripheralDelegate {
                 finish(success: true, "Persistence confirmed — the ring remembered our key.")
             }
         default:
-            break
+            // In factory-reset mode, a 0x1B response is the ResetMemory ack.
+            if resetSent, parsed.payload.first == 0x1B {
+                completeFactoryReset(acked: true)
+            }
         }
     }
 
@@ -572,6 +591,44 @@ extension RingManager: CBPeripheralDelegate {
         onboardingStep = .failed(reason)
         logError(reason.title)
     }
+
+    // MARK: factory reset (ported from ble-explorer's `--reset`, same verified frame)
+    /// Authenticated with our key — now erase the ring's memory so it returns to
+    /// pairing mode and can be re-onboarded (by this app or the Oura app) fresh.
+    /// Mirrors the VERIFIED macOS sequence: ResetMemory(false) = [0x1A 0x00], whose
+    /// ack is a notification whose first byte is 0x1B. Some firmwares reset without
+    /// replying, so a grace timer finishes the op even if no ack arrives.
+    @MainActor private func startFactoryReset() {
+        guard !resetSent else { return }
+        resetSent = true
+        phase = .authenticating
+        info("→ ResetMemory (factory reset, [0x1A 0x00])…")
+        write(Data([OuraOpcode.resetMemory, 0x00]))   // matches the app's ResetMemory(false)
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.completeFactoryReset(acked: false)
+        }
+        resetGraceWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+
+    /// Finish a factory-reset op exactly once — whether the 0x1B ack arrived or the
+    /// grace timer fired first. Tears the link down (the ring is rebooting) so we
+    /// don't try to reuse a dead connection.
+    @MainActor private func completeFactoryReset(acked: Bool) {
+        guard resetSent, step != .done else { return }
+        resetGraceWork?.cancel(); resetGraceWork = nil
+        resetSent = false
+        if acked { logSuccess("ResetMemory acknowledged by the ring.") }
+        finish(success: true,
+               "Factory reset sent. The ring is erasing its memory — leave it still ~2 min. It can now be re-onboarded.")
+        tearDownConnection()   // finish() keeps the link on success; a resetting ring won't honor it.
+        factoryResetSucceeded = true
+    }
+
+    /// Called by the UI once it has handled `factoryResetSucceeded` (deleted the key,
+    /// signed out). Clears the flag so it doesn't re-trigger.
+    func acknowledgeFactoryReset() { factoryResetSucceeded = false }
 
     // MARK: read sequence (ported from startReadSequence, same verified timings)
     @MainActor private func startReadSequence() {
