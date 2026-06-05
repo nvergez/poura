@@ -17,32 +17,32 @@
 import Foundation
 import CommonCrypto
 
-enum OuraOpcode {
+public enum OuraOpcode {
     // Direct opcodes (confirmed in capture)
-    static let getFirmwareVersion: UInt8 = 0x08
-    static let getBatteryLevel: UInt8 = 0x0C
-    static let getEvent: UInt8 = 0x10
-    static let syncTime: UInt8 = 0x12
-    static let setBleMode: UInt8 = 0x16
-    static let getProductInfo: UInt8 = 0x18
-    static let resetMemory: UInt8 = 0x1A     // factory reset (from app code)
-    static let setNotification: UInt8 = 0x1C
-    static let setAuthKey: UInt8 = 0x24      // KEY_LENGTH=16, resp tag 0x25, 0x00=success
-    static let dataFlush: UInt8 = 0x28
-    static let ext: UInt8 = 0x2F             // extended base tag
+    public static let getFirmwareVersion: UInt8 = 0x08
+    public static let getBatteryLevel: UInt8 = 0x0C
+    public static let getEvent: UInt8 = 0x10
+    public static let syncTime: UInt8 = 0x12
+    public static let setBleMode: UInt8 = 0x16
+    public static let getProductInfo: UInt8 = 0x18
+    public static let resetMemory: UInt8 = 0x1A     // factory reset (from app code)
+    public static let setNotification: UInt8 = 0x1C
+    public static let setAuthKey: UInt8 = 0x24      // KEY_LENGTH=16, resp tag 0x25, 0x00=success
+    public static let dataFlush: UInt8 = 0x28
+    public static let ext: UInt8 = 0x2F             // extended base tag
 
     // Extended sub-tags (under 0x2F)
-    static let extGetAuthNonce: UInt8 = 0x2B
-    static let extGetAuthNonceResp: UInt8 = 0x2C
-    static let extAuthenticate: UInt8 = 0x2D
-    static let extAuthResp: UInt8 = 0x2E
+    public static let extGetAuthNonce: UInt8 = 0x2B
+    public static let extGetAuthNonceResp: UInt8 = 0x2C
+    public static let extAuthenticate: UInt8 = 0x2D
+    public static let extAuthResp: UInt8 = 0x2E
 }
 
-enum OuraProtocol {
+public enum OuraProtocol {
 
     /// Generate our own 16-byte auth key (cryptographically random), like the
     /// official app does (it uses a random UUID → 16 bytes).
-    static func randomAuthKey() -> Data {
+    public static func randomAuthKey() -> Data {
         var bytes = [UInt8](repeating: 0, count: 16)
         _ = SecRandomCopyBytes(kSecRandomDefault, 16, &bytes)
         return Data(bytes)
@@ -51,7 +51,7 @@ enum OuraProtocol {
     // MARK: - Frame builders
 
     /// SetAuthKey: [0x24][0x10][16-byte key]
-    static func setAuthKey(_ key: Data) -> Data {
+    public static func setAuthKey(_ key: Data) -> Data {
         precondition(key.count == 16, "auth key must be 16 bytes")
         var f = Data([OuraOpcode.setAuthKey, 0x10])
         f.append(key)
@@ -59,12 +59,12 @@ enum OuraProtocol {
     }
 
     /// GetAuthNonce: [0x2F][0x01][0x2B]
-    static func getAuthNonce() -> Data {
+    public static func getAuthNonce() -> Data {
         Data([OuraOpcode.ext, 0x01, OuraOpcode.extGetAuthNonce])
     }
 
     /// Authenticate: [0x2F][0x11][0x2D][16-byte proof]
-    static func authenticate(proof: Data) -> Data {
+    public static func authenticate(proof: Data) -> Data {
         precondition(proof.count == 16, "proof must be 16 bytes")
         var f = Data([OuraOpcode.ext, 0x11, OuraOpcode.extAuthenticate])
         f.append(proof)
@@ -72,23 +72,23 @@ enum OuraProtocol {
     }
 
     /// Factory reset over BLE: ResetMemory(true) = [0x1A][0x01][0x01]
-    static func resetMemoryFull() -> Data {
+    public static func resetMemoryFull() -> Data {
         Data([OuraOpcode.resetMemory, 0x01, 0x01])
     }
 
-    static func getBatteryLevel() -> Data { Data([OuraOpcode.getBatteryLevel, 0x00]) }
-    static func getProductInfo(sub: UInt8) -> Data { Data([OuraOpcode.getProductInfo, 0x03, sub, 0x00, 0x10]) }
+    public static func getBatteryLevel() -> Data { Data([OuraOpcode.getBatteryLevel, 0x00]) }
+    public static func getProductInfo(sub: UInt8) -> Data { Data([OuraOpcode.getProductInfo, 0x03, sub, 0x00, 0x10]) }
 
     /// GetFirmwareVersion: observed in capture as `08 03 00 00 00`.
-    static func getFirmwareVersion() -> Data { Data([OuraOpcode.getFirmwareVersion, 0x03, 0x00, 0x00, 0x00]) }
+    public static func getFirmwareVersion() -> Data { Data([OuraOpcode.getFirmwareVersion, 0x03, 0x00, 0x00, 0x00]) }
 
     /// SetBleMode: the app sends `16 01 02` right after auth. Appears to switch the
     /// ring into the "connected/active" mode that unlocks info + streaming.
-    static func setBleMode(_ mode: UInt8) -> Data { Data([OuraOpcode.setBleMode, 0x01, mode]) }
+    public static func setBleMode(_ mode: UInt8) -> Data { Data([OuraOpcode.setBleMode, 0x01, mode]) }
 
     /// SyncTime (0x12): `12 09 <unix_ts LE u32> 00 00 00 00 <tz/flag>`. The app sends
     /// the current unix time so the ring can anchor its tick counter to wall-clock.
-    static func syncTime(unix: UInt32, flag: UInt8 = 0x04) -> Data {
+    public static func syncTime(unix: UInt32, flag: UInt8 = 0x04) -> Data {
         var f = Data([OuraOpcode.syncTime, 0x09])
         var le = unix.littleEndian
         withUnsafeBytes(of: &le) { f.append(contentsOf: $0) }   // 4 bytes
@@ -99,10 +99,10 @@ enum OuraProtocol {
 
     /// SetNotification (0x1C): app sends `1c 01 bf` — enable the notification/event
     /// firehose (bitmask 0xbf selects which record classes the ring pushes).
-    static func setNotification(_ mask: UInt8 = 0xbf) -> Data { Data([OuraOpcode.setNotification, 0x01, mask]) }
+    public static func setNotification(_ mask: UInt8 = 0xbf) -> Data { Data([OuraOpcode.setNotification, 0x01, mask]) }
 
     /// data_flush / CheckSleepAnalysis (0x28): app sends `28 01 00` before GetEvent.
-    static func dataFlush() -> Data { Data([OuraOpcode.dataFlush, 0x01, 0x00]) }
+    public static func dataFlush() -> Data { Data([OuraOpcode.dataFlush, 0x01, 0x00]) }
 
     // MARK: - Feature subscription (ext 0x2F) — measurement enable
 
@@ -113,16 +113,16 @@ enum OuraProtocol {
     ///   subscribe:  2f 03 26 <featureID> <value>  → resp 2f 03 27 <id> <code>
     /// The decisive one before the stream opens is `2f 03 26 02 02` (subscribe
     /// feature 0x02 = 0x02), preceded by `2f 03 22 02 03` (set feature 0x02 = 0x03).
-    static func featureGet(_ id: UInt8) -> Data { Data([OuraOpcode.ext, 0x02, 0x20, id]) }
-    static func featureSet(_ id: UInt8, _ value: UInt8) -> Data { Data([OuraOpcode.ext, 0x03, 0x22, id, value]) }
-    static func featureSubscribe(_ id: UInt8, _ value: UInt8) -> Data { Data([OuraOpcode.ext, 0x03, 0x26, id, value]) }
+    public static func featureGet(_ id: UInt8) -> Data { Data([OuraOpcode.ext, 0x02, 0x20, id]) }
+    public static func featureSet(_ id: UInt8, _ value: UInt8) -> Data { Data([OuraOpcode.ext, 0x03, 0x22, id, value]) }
+    public static func featureSubscribe(_ id: UInt8, _ value: UInt8) -> Data { Data([OuraOpcode.ext, 0x03, 0x26, id, value]) }
 
     /// GetEvent (0x10): history fetch by ringTimestamp cursor.
     /// Wire layout (11 bytes, per open_ring PROTOCOL.md, to be validated on the ring):
     ///   [0x10][0x09][cursor u32 LE][max_events u8][flags u32 LE = 0xFFFFFFFF]
     /// `cursor` = ringTimestamp to resume after (0 = full dump); `maxEvents` ≤255 to
     /// fetch, 0 = ack-only (advance the cursor without data).
-    static func getEvent(cursor: UInt32, maxEvents: UInt8 = 0xFF) -> Data {
+    public static func getEvent(cursor: UInt32, maxEvents: UInt8 = 0xFF) -> Data {
         var f = Data([OuraOpcode.getEvent, 0x09])
         var le = cursor.littleEndian
         withUnsafeBytes(of: &le) { f.append(contentsOf: $0) }   // 4 bytes cursor
@@ -135,7 +135,7 @@ enum OuraProtocol {
 
     /// proof = AES-128-ECB(authKey, nonce ‖ 0x01), single 16-byte block.
     /// `nonce` is the 15-byte value from the ring; we append 0x01 to fill the block.
-    static func computeProof(authKey: Data, nonce15: Data) -> Data? {
+    public static func computeProof(authKey: Data, nonce15: Data) -> Data? {
         precondition(authKey.count == 16, "auth key must be 16 bytes")
         guard nonce15.count == 15 else { return nil }
         var block = nonce15
@@ -144,7 +144,7 @@ enum OuraProtocol {
     }
 
     /// Raw AES-128-ECB on a single 16-byte block, no padding (one block in, one out).
-    static func aes128ECBEncrypt(key: Data, block16: Data) -> Data? {
+    public static func aes128ECBEncrypt(key: Data, block16: Data) -> Data? {
         guard key.count == 16, block16.count == 16 else { return nil }
         var out = Data(count: 16)
         var moved = 0
@@ -173,7 +173,7 @@ enum OuraProtocol {
     /// Parse a notify payload from handle 0x0012.
     /// Returns ("nonce", 15B) for GetAuthNonce resp, ("auth", [code]) for AuthResponse,
     /// ("setauthkey", [code]) for SetAuthKey resp, else ("raw", data).
-    static func parseNotification(_ data: Data) -> (kind: String, payload: Data) {
+    public static func parseNotification(_ data: Data) -> (kind: String, payload: Data) {
         guard let first = data.first else { return ("empty", data) }
         if first == OuraOpcode.ext, data.count >= 3 {
             let sub = data[data.index(data.startIndex, offsetBy: 2)]
@@ -206,17 +206,24 @@ enum OuraProtocol {
     // MARK: - Info-response decoding (battery / firmware / product)
 
     /// A decoded TLV record from the stream / history firehose.
-    struct Record {
-        let type: UInt8
-        let counter: UInt16
-        let session: UInt16
-        let payload: Data
-        var ringTimestamp: UInt32 { (UInt32(session) << 16) | UInt32(counter) }
+    public struct Record {
+        public let type: UInt8
+        public let counter: UInt16
+        public let session: UInt16
+        public let payload: Data
+        public var ringTimestamp: UInt32 { (UInt32(session) << 16) | UInt32(counter) }
+
+        public init(type: UInt8, counter: UInt16, session: UInt16, payload: Data) {
+            self.type = type
+            self.counter = counter
+            self.session = session
+            self.payload = payload
+        }
     }
 
     /// Human label for a record type. Names are from the public RE notes
     /// (open_ring / ringverse) and are to be re-validated against our own data.
-    static func recordTypeName(_ t: UInt8) -> String {
+    public static func recordTypeName(_ t: UInt8) -> String {
         switch t {
         case 0x33: return "accel"
         case 0x41: return "boot/start"
@@ -250,7 +257,7 @@ enum OuraProtocol {
     /// `len` counts the 4 timestamp bytes + payload (per the public spec). We parse
     /// defensively: a bad length stops the walk rather than reading out of bounds.
     /// Returns the records plus any trailing bytes we couldn't frame (for debugging).
-    static func decodeRecords(_ buf: Data) -> (records: [Record], leftover: Data) {
+    public static func decodeRecords(_ buf: Data) -> (records: [Record], leftover: Data) {
         var records: [Record] = []
         let bytes = [UInt8](buf)
         var i = 0
@@ -280,7 +287,7 @@ enum OuraProtocol {
     ///    (packing needs worn-data validation; flagged rather than guessed).
     /// From a list of beat tokens (numeric ms or "·" markers), append a mean-HR hint
     /// when there are enough clean beats to be meaningful.
-    static func hrSuffix(_ beats: [String]) -> String {
+    public static func hrSuffix(_ beats: [String]) -> String {
         let ms = beats.compactMap { Double($0) }.filter { $0 >= 300 && $0 <= 1500 }
         guard ms.count >= 2 else { return "" }
         let mean = ms.reduce(0, +) / Double(ms.count)
@@ -289,7 +296,7 @@ enum OuraProtocol {
 
     /// Clean inter-beat intervals (ms) from a 0x80 or 0x60 record, sentinels dropped.
     /// Same bit-layout as `decodeBiosignal` but returns numbers for aggregation.
-    static func ibiValues(_ r: Record) -> [Int] {
+    public static func ibiValues(_ r: Record) -> [Int] {
         let p = [UInt8](r.payload)
         var out: [Int] = []
         if r.type == 0x80 {
@@ -314,7 +321,7 @@ enum OuraProtocol {
         return out
     }
 
-    static func decodeBiosignal(_ r: Record) -> String? {
+    public static func decodeBiosignal(_ r: Record) -> String? {
         let p = [UInt8](r.payload)
         switch r.type {
         case 0x46:   // temperature
