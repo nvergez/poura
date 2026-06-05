@@ -80,6 +80,7 @@ cd ble-explorer && swift build
 .build/debug/ble-explorer --oura               # find + connect the ring, dump GATT
 .build/debug/ble-explorer --takeover           # set OUR key on a FACTORY-RESET ring (pairing mode)
 .build/debug/ble-explorer --auth [hexkey]      # authenticate (key from arg or Keychain)
+.build/debug/ble-explorer --firmware [hexkey]  # authenticate then READ firmware version + product info (no writes)
 .build/debug/ble-explorer --read [hexkey]      # auth → infos → subscribe feat 0x02 → live AFE stream
 .build/debug/ble-explorer --read --history     # also dump buffered flash history (GetEvent)
 .build/debug/ble-explorer --read --seconds 30  # keep the live-stream window open for 30s
