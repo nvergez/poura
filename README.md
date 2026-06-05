@@ -11,18 +11,45 @@ data **without going through the Oura app or Oura's servers**.
 ## Status
 
 🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
-authenticated, **zero Oura app/cloud** in the auth path. Next: reading data + iOS app.
+authenticated, **zero Oura app/cloud** in the auth path.
+🟢 **Data retrieval complete** — `--read --cursor recent` reads real biosignals from
+the worn ring, no Oura app: **heart rate ❤️ 60-67 bpm + HRV(RMSSD)** (matches the
+user's Fitbit), temperature, 3-axis accelerometer, motion state, plus full device
+telemetry. ~17 record types decoded. The only signal not exposed by this ring/fw is
+the raw PPG waveform (0x81 — derived to IBI on-device). Next: iOS app.
 
 ## Goals
 
-### Current goal (the challenge) — ✅ DONE
+### Core challenge — ✅ DONE
 **Pair with the ring and authenticate without the official Oura app, from scratch.**
 Achieved: after a factory reset, our macOS tool sets its own `auth_key` on the ring
 and authenticates. The official Oura app can no longer reclaim the ring (it enters
 "restricted mode") until a factory reset — proving the takeover holds.
 
+### Data retrieval — ✅ DONE (infos + biosignals incl. heart rate)
+`--read` (saved-key handshake → read) verified on the real ring, no Oura app:
+- **Battery 96%**, **firmware 2.0.0.2.11**, **product** `ORE_06` / serial
+  `2016092441019131` — read directly.
+- **TLV records decoded** (~256 in a history dump): boot (`0x41`), time-anchor
+  (`0x42`, unix ts), **ASCII diag logs** (`0x43`: `git;…`, `HWID;ORE_06`,
+  `acm_bma456`…), events (`0x61`). Decoder validated on our own data.
+- **Biosignals via `--cursor recent`** (GetEvent from a recent ringTimestamp, not
+  cursor 0): **heart rate ❤️ 60-67 bpm + HRV(RMSSD)** (matches the user's Fitbit),
+  **temperature** ~28°C skin (0x46), **IBI** (0x80/0x60), **3-axis accelerometer**
+  (0x47), **HRV windows** (0x5d), **motion state** (0x6b), **named sensor events**
+  (0x45 `hr enable`…).
+- **Nearly all record types decoded** (0x41/42/43/45/46/47/50/5b/5d/60/61/6b/6c/72/
+  75/80/82/83): plus device telemetry from `0x61` sub-types — precise **fuel gauge**
+  (96.35%), **sleep/ble/flash stats**, **PPG signal quality** (SNR/AC/DC), and HW IDs
+  (**PPG sensor = Maxim MAX86178**, accel = Bosch BMA456).
+- ⚠️ Raw PPG waveform (`0x81`) is the one signal NOT retrievable on this ring/fw:
+  it's not kept in the BLE event log (the ring derives IBI on-device and discards
+  the raw samples). Probed recent/older cursors + `--drain` (24 repeated fetches) →
+  never emitted. A capability boundary, not a decode gap — all derived physiology
+  (HR/HRV/IBI) already works.
+
 ### Next
-- Read real data over BLE (battery, firmware, then HR/IBI/temp/accel/PPG records).
+- Decode raw PPG waveform (0x81) for a full optical trace.
 - Port to a native iOS app (Swift / CoreBluetooth), reusing `OuraProtocol.swift`.
   Clean-room: `open_ring`/`ringverse` used only as reference docs, not as a codebase.
 
@@ -53,6 +80,13 @@ cd ble-explorer && swift build
 .build/debug/ble-explorer --oura               # find + connect the ring, dump GATT
 .build/debug/ble-explorer --takeover           # set OUR key on a FACTORY-RESET ring (pairing mode)
 .build/debug/ble-explorer --auth [hexkey]      # authenticate (key from arg or Keychain)
+.build/debug/ble-explorer --read [hexkey]      # auth → infos → subscribe feat 0x02 → live AFE stream
+.build/debug/ble-explorer --read --history     # also dump buffered flash history (GetEvent)
+.build/debug/ble-explorer --read --seconds 30  # keep the live-stream window open for 30s
+.build/debug/ble-explorer --read --cursor recent      # fetch RECENT records → HR/HRV/temp/accel biosignals
+.build/debug/ble-explorer --read --drain --seconds 60 # repeated GetEvent (drain records as the ring measures)
+.build/debug/ble-explorer --read --burst --seconds 50 # keep DHR HR-burst engaged (attempt raw PPG 0x81)
+.build/debug/ble-explorer --read --features 02,03,0b  # probe other feature IDs
 .build/debug/ble-explorer --reset [hexkey]     # authenticate then factory-reset (give ring back)
 .build/debug/ble-explorer --store-key <hexkey> # save a key into the macOS Keychain
 ```

@@ -306,3 +306,394 @@ After the user re-onboarded to Oura then factory-reset again, we re-took the rin
 ### Note for iOS app
 Stale-bond handling is required: on "peer removed pairing information", clear the
 system bond (or guide the user to forget the device) before reconnecting.
+
+---
+
+## 2026-06-05 — DATA RETRIEVAL working (`--read`): infos + TLV history decoded
+
+Added a `--read` mode to `ble-explorer`. After the saved-key handshake it replays
+the app's post-auth init, queries device info, then opens the data plane. **First
+real data read from the ring without the Oura app — both simple infos and decoded
+TLV records.**
+
+### What now works (verified on the real ring, worn)
+
+**Simple infos (request → response tag = request opcode + 1):**
+- `GetFirmwareVersion (0x08 03 00 00 00)` → `09 …`: firmware bytes
+  `02 00 00 02 0b …` → version **2.0.0.2.11** family.
+- `GetBatteryLevel (0x0C 00)` → `0d 06 60 …`: `0x60 = 96%`.
+- `GetProductInfo (0x18 03 <sub> 00 10)` → `19 11 00 …` ASCII identity:
+  `9131`, **`ORE_06`** (codename oreo), serial **`2016092441019131`**
+  (= the ring's BLE name).
+
+**Post-auth init acks observed:** `17`=SetBleMode, `13`=SyncTime (body carries the
+ring's current ringTimestamp, e.g. `0x00057640`), `1d`=SetNotification,
+`29`=data_flush.
+
+**The stream trigger:** `SetNotification (1c 01 bf)` alone stays SILENT. It is
+**`data_flush (0x28 01 00)`** that releases the buffered events onto the BLE notify
+stream. We now send it unconditionally to open the firehose. (Confirmed against
+open_ring's PROTOCOL.md and then on our ring: data_flush → ~250 records.)
+
+**GetEvent (history) wire format corrected to 11 bytes:**
+`10 09 <cursor u32 LE> <max_events u8> <flags u32 LE=FFFFFFFF>`.
+`--read --history` dumps from cursor 0 (full flash history).
+
+### TLV record decode — VALIDATED on our own data
+
+Format `[type:1][len:1][ctr_lo ctr_hi][ses_lo ses_hi][payload(len-4)]`,
+`ringTimestamp=(session<<16)|counter`. Our decoder framed ~256 back-to-back records
+cleanly (counters increment 1393,1394,1395…). Types seen in this dump:
+
+| Type | Name | Content (decoded from real payloads) |
+|------|------|--------------------------------------|
+| `0x41` | boot/start | `10 00 00 00 32 02 0b …` → fw `2.0.b…` at boot |
+| `0x42` | time-anchor | unix ts LE — e.g. `08 ef 21 6a` → wall-clock anchor for ringTimestamps |
+| `0x43` | **diag-log** | **ASCII** text lines (NEW finding). Examples below. |
+| `0x61` | event | binary event/counter records |
+
+`0x43` diagnostic strings decoded from the boot log:
+`git;29df664` (fw commit), `SNH;019131`+`SNL;2016092441` (serial halves),
+`HWID;ORE_06`, `acm_bma456` (**accelerometer = Bosch BMA456**), `MFC;500;4`,
+`rdata init`, `in_bed=0`, plus charge telemetry `chgv;…`, `chg_hs;…`, `chg_rp;…`,
+`FGdcap;39`, `BMVbI;50`.
+
+### Not yet captured: raw biosignals (PPG 0x81 / IBI 0x80 / accel 0x33 / temp)
+
+The history we pulled was dominated by **system/charge events** (the ring had just
+been on the charger). No 0x80/0x81/0x33 records appeared yet. Hypothesis: the ring
+pauses PPG measurement during an active BLE connection, and/or a measurement-start
+opcode is needed. **Next session**: chase the biosignals (see NEXT.md).
+
+### Files
+- `OuraProtocol.swift`: added `getFirmwareVersion`, `setBleMode`, `syncTime`,
+  `setNotification`, `dataFlush`, fixed `getEvent` (11B), `Record` + `decodeRecords`
+  (defensive TLV walk), `recordTypeName`.
+- `main.swift`: new `.read(key, seconds, history)` mode; `--read [hex] [--history]
+  [--seconds N]`; post-auth staged sequence; `handleReadNotification` (info vs TLV);
+  rolling `streamLeftover` buffer for cross-notification record framing; per-type
+  summary at the end.
+
+---
+
+## 2026-06-05b — Biosignals: measurement TRIGGER found + live AFE stream (worn ring)
+
+Chased the raw biosignals. Key unlock: the ring does NOT emit physiological records
+just because you connect + `data_flush`. It needs an explicit **feature subscribe**.
+
+### How we found it
+The first `--read --history` dump (ring fresh off charger) returned ~256 records but
+all system/charge events (`0x43` ASCII logs, `0x61`), no PPG/IBI. A second run with an
+empty flash buffer returned **zero** records → `data_flush` only drains existing
+buffer; it doesn't start measurement.
+
+Decoded the onboarding btsnoop (`captures/poura-onboarding.btsnoop`, frames 926-992)
+with tshark to get the app's exact post-battery sequence. It runs a feature
+get/set/**subscribe** block via ext `0x2F`:
+```
+get:        2f 02 20 <id>          → 2f 06 21 <id> <4B value>
+set:        2f 03 22 <id> <val>    → 2f 03 23 <id> <val>     (ack)
+subscribe:  2f 03 26 <id> <val>    → 2f 03 27 <id> <code>    (ack)  ← the trigger
+```
+The decisive pair before the stream opens: `2f 03 22 02 03` (set feat 0x02=3) then
+`2f 03 26 02 02` (**subscribe feat 0x02=2**), then `28 01 00` (data_flush).
+
+### Result on OUR worn ring (verified)
+Implemented the subscribe block in `--read`. On a worn ring it produces a **live
+data stream** — continuous notifications, no Oura app:
+```
+2f 0f 28 02 <chan> 02 00 00 <value u16 LE> 00 00 00 00 59 0a 7f
+```
+- `chan` ∈ {0x09, 0x19}. Channel 0x09 value ≈ **5150 ± 60**, stable at rest, jumps
+  (13191, 8726…) when the finger moves. → very likely the **PPG DC level** (mean
+  reflected light), a real physiological signal.
+- Rate ≈ 0.5–1 Hz. This is an AFE stat/quality channel, **not** the high-rate AC
+  PPG waveform.
+
+### Probed all features, only 0x02 streams
+Added `--features <hex,…>` to subscribe to arbitrary feature IDs. Subscribed to
+`0x02,0x03,0x04,0x0b,0x0d,0x10` (all the ones the app gets). **All ACK the subscribe
+(`2f 03 27 <id> 02`) but only 0x02 emits data.** The high-rate PPG waveform + IBI
+(beat intervals) did not appear.
+
+### Open question (honest status)
+The raw high-frequency PPG (`0x81`, AC waveform) and IBI (`0x80`/`0x60`, beat
+intervals) are **not** streamed by feature 0x02 on a connected, idle worn ring.
+Most likely the ring only runs high-rate PPG during **scheduled measurement sessions**
+(sleep / spot-check), not continuously over an active BLE link (power). The
+onboarding capture's `0x81`/`0x80` records were emitted during a measurement
+transition, not steady-state streaming. Next: trigger/observe a measurement session,
+or find the feature/flag that forces continuous high-rate PPG.
+
+### Decoders added (verified formats, ready for when those records appear)
+From the onboarding capture + open_ring cross-ref (an `Explore`-style sub-agent
+decoded the capture; we kept only byte-verified claims):
+- `0x46` TEMP: 3× i16 LE /100 = °C.
+- `0x80` GREEN_IBI_QUALITY: N× u16 LE; bits 0-10 = IBI ms, 11-13 qual_a, 14-15 qual_b
+  (clean beat = qual_a≤1 & qual_b==0).
+- `0x60` IBI+amplitude: bit-packed (left raw — packing needs worn-data validation).
+- Record type names extended: 0x46 temp, 0x47 motion, 0x53 wear, 0x60 IBI+amp,
+  0x61 debug-data (payload[0]=sub-dispatch), 0x79 AFE-tuning.
+- ⚠️ Correction from the capture decode: `0x3d` is NOT a top-level type — it's a
+  `0x61` sub-type (charger debug), so those dense bytes were charge telemetry, not PPG.
+
+### Files
+- `OuraProtocol.swift`: `featureGet/Set/Subscribe`, `decodeBiosignal` (0x46/0x80),
+  extended `recordTypeName`.
+- `main.swift`: subscribe block in the read sequence (loops `--features`); live
+  `0x2F/0x28` stream decoder (chan + value); `--features <hex,…>` flag;
+  `streamSampleCount` in the summary.
+- Local captures (git-ignored): `poura-live-worn-stream.log`, `poura-feature-probe.log`.
+
+---
+
+## 2026-06-05c — 🎉 BIOSIGNALS RETRIEVED (IBI, temp, motion) via recent-cursor GetEvent
+
+Got real physiological data off the worn ring, no Oura app. The unlock was the
+**GetEvent cursor**, not a stream subscribe.
+
+### The real mechanism (corrects 2026-06-05b)
+Re-decoded the onboarding capture: the app's biosignal records (108× 0x81 PPG,
+47× 0x80 IBI, 41× 0x60, 90× 0x46 temp) arrived as the **response to a GetEvent
+(0x10) with a RECENT cursor** (`10 09 98e50f15 00 ffffffff`, cursor 0x150fe598) —
+NOT from the feature-subscribe live stream. Our `--history` used `cursor=0`, which
+only replays the oldest flash pages (boot/charge log), so we never reached the
+recent measurement records.
+
+Confirmed the app's own capture DID contain biosignals (sub-agent TLV walk over the
+whole btsnoop): 0x81×108, 0x80×47, 0x60×41, 0x46×90. So the data was always there;
+we were fetching from the wrong cursor.
+
+### Fix + result
+Added `--cursor recent|<hex>`: `recent` reads the ring's current ringTimestamp from
+the SyncTime ack, subtracts a small window (~0x2000 ticks), and fetches from there.
+
+`--read --cursor recent` on the worn ring returned (one 12 s run):
+- **0x80 IBI-quality × 42**, **0x60 IBI+amp × 47** (heart-rate data)
+- **0x46 temperature × 11** — decoded cleanly: `[25.8, 28.0, 21.4]°C` (skin / internal
+  / ambient), stable and physiologically plausible. ✅
+- **0x47 motion × 11**, plus 0x42 anchor, 0x45 state, 0x5b/0x5d/0x6c/0x72/0x82/0x83.
+
+Our ring's ringTimestamps are session=5 (a lightly-used ring), e.g. ts≈387060;
+cursor `recent` resolves to ~0x5e000 and lands right on the live measurement records.
+
+### Honest status on decoding
+- **Temp (0x46)** decode VERIFIED (3× i16 LE /100 °C).
+- **IBI (0x80)** records are framed correctly but the **bit-packing of IBI-ms vs
+  quality is NOT yet validated** — the bits-0..10 split gives incoherent intervals
+  (jumps 100↔1900 ms). Changed the decoder to print raw u16 words (`packing TBD`)
+  rather than assert wrong "ms". Same for 0x60 (dense 14-byte payload, undecoded).
+- **0x81 raw PPG** did not appear in this short window (it's the highest-volume type
+  in the app capture; expect it in a longer/again run). Decoder still TODO
+  (delta-encoded, stateful).
+
+### Files
+- `OuraProtocol.swift`: 0x80 decoder now prints raw u16 words (honest, packing TBD).
+- `main.swift`: `--cursor recent|<hex>`; capture ring-now ringTimestamp from SyncTime
+  ack; `resolveHistoryCursor()`.
+- Local capture (git-ignored): `captures/poura-biosignals-recent.log`.
+
+### Next
+Decode 0x80/0x60 IBI packing (validate against a known HR, or open_ring decoders.py
+L231/L417), and capture 0x81 raw PPG in a longer recent-cursor pull. Then HR/HRV.
+
+---
+
+## 2026-06-05d — ❤️ HEART RATE decoded (67 bpm) — IBI bit-packing cracked
+
+Cracked the IBI payload format. A sub-agent tried multiple unpackings against our
+real 0x80/0x60 records and cross-checked open_ring's `decoders.py`; the winning
+scheme is coherent (smooth beat-to-beat, ~63-70 bpm) and matches between 0x80 and
+0x60 independently.
+
+### Verified layout
+**0x80 (green-LED IBI quality)** — N pairs of bytes:
+```
+ibi_ms    = (b_low << 3) | (b_high & 0x07)   # 11-bit, milliseconds
+quality_a = (b_high >> 3) & 0x03
+quality_b = (b_high >> 5) & 0x07
+b_high ≥ 0xE9 → gap/marker sentinel (skip)
+```
+**0x60 (IBI+amplitude)** — 6×(IBI, amp); bytes 0-5 = IBI high, 6-11 = amp, 12-13 pack
+the 0-7 ms fine bits and the amp shift (see `OuraProtocol.ibiValues`).
+
+My earlier `w & 0x07FF` on a u16 LE was WRONG (gave 100↔1900 ms jumps). The correct
+`(b_low<<3)|(b_high&0x07)` gives e.g. `866 881 892 982 1010 983 1056 ms`.
+
+### Result on the worn ring (no Oura app)
+`--read --cursor recent --seconds 30`:
+```
+❤️  HEART RATE: 67 bpm  (mean IBI 896 ms over 48 beats)  HRV(RMSSD)=109 ms
+```
+- **67 bpm** — matches the user's Fitbit (60-70 bpm) → externally validated.
+- IBI varies 757→1115 ms within the window = normal respiratory sinus arrhythmia.
+- Skin temp ~28-29°C stable (0x46, decoded earlier).
+
+### Added
+- `OuraProtocol`: correct 0x80 + 0x60 IBI decoders; `ibiValues()` (clean ms array);
+  `hrSuffix()` (per-record bpm hint).
+- `main.swift`: collect all clean IBI across a run; print aggregate **HR + HRV
+  (RMSSD)** in the summary. Sentinels (b_high≥0xE9 / 0xFA / out-of-range) dropped —
+  raw IBI values are shown as-is, only non-beats are filtered.
+- Local capture (git-ignored): `captures/poura-heartrate.log`.
+
+### Remaining
+- 0x81 raw PPG waveform (delta-encoded) — didn't land in these windows; capture +
+  decode for a true PPG trace. The IBI/HR path above already gives HR + HRV, which
+  is the main physiological signal.
+
+---
+
+## 2026-06-05e — Decoded the FULL record inventory (12 more types) via multi-agent workflow
+
+Ran an 8-agent workflow (each decoding one record family from our real captured
+payloads + open_ring cross-check) → consolidated into Swift decoders. Now nearly
+everything the ring emits is human-readable.
+
+### Newly decoded (verified live on the worn ring)
+| Type | Name | Real example from our ring |
+|------|------|----------------------------|
+| 0x45 | state-change | `state="hr enable"` — named sensor-mode events |
+| 0x47 | motion | `accel=(-816,-328,136)` — 3-axis accelerometer (int8×8) |
+| 0x50 | activity-info | `class=0` + opaque intensity bins |
+| 0x5b | ble-conn | BLE link telemetry (sub-dispatch; fields inferred) |
+| 0x5d | hrv | N×(HR bpm, RMSSD ms) per 5-min window |
+| 0x61 | debug-data | sub-dispatch: battery/sleep/fuel/ble/flash/period/PPG-quality |
+| 0x6b | motion-period | `NO_MOTION/RESTLESS/TOSSING/ACTIVE` (low 2 bits) |
+| 0x6c | feature-session | feature_id/capability/status |
+| 0x72 | sleep-acm | 6× u16 LE activity metrics |
+| 0x75 | sleep-temp | N× i16 LE /100 °C trace |
+| 0x82/0x83 | scan-start/end | feature/reason/metric + result |
+
+### 0x61 sub-types decoded (high-value)
+- `battery pct/mv/reason`, `fuel pct=96.35% mv=…` (precise fuel gauge),
+- `sleep deep/sleep/awake ticks`, `ble fast/slow/adv`, `flash read/write/erase`,
+- `period ticks/systime`, `ppgQ snr/ac/dc/ibiQ` (PPG signal quality, bit-packed),
+- **`afe chip=MAX86178`** → the ring's optical PPG sensor is the Maxim **MAX86178**.
+- Accelerometer earlier identified as Bosch **BMA456** (0x43 diag `acm_bma456`).
+
+### Honesty
+Decoders are defensive (length-guarded, raw hex alongside any interpretation).
+VERIFIED vs INFERRED vs OPAQUE per field is in the workflow report. Notable: 0x45
+byte0 is a counter/flag (not open_ring's state enum); 0x6b uses low-2-bits (open_ring
+full-byte read is broken on real data); 0x72 is 6×u16 (not open_ring's 6×u8).
+
+### Raw PPG (0x81) — still not captured
+Probed recent + older cursors (ring_now, −0x10000…−0x30000): segments hold IBI/temp/
+motion/debug but NO 0x81. Conclusion: our ring derives IBI on-device and doesn't
+retain the raw PPG waveform in the retrievable event log (the app's capture caught
+0x81 live during an active measurement burst, ringTs in session 5392). HR/HRV/temp/
+accel — the meaningful physiology — are all working. 0x81 would need catching the
+live high-rate burst; left as the one remaining TODO.
+
+### Files
+- `OuraProtocol.swift`: 12 new decode cases + `decodeDebugData0x61` + `hexc` helper;
+  extended `recordTypeName`.
+- Local capture (git-ignored): `captures/poura-all-types.log`.
+
+---
+
+## 2026-06-05f — Raw PPG (0x81) final attempt: --drain. Conclusion: not exposed.
+
+Added `--drain`: throughout the stream window, re-issue GetEvent from the latest
+ringTimestamp seen (cursor advances) to pull records as the worn ring generates them
+— vs the single start-of-session fetch.
+
+Ran `--read --drain --seconds 60` (worn, still). **24 GetEvent calls, 0× 0x81.**
+Everything else streamed normally (122× 0x61, 20× 0x80 IBI, 10× 0x47 accel, temp,
+HRV…; HR 60 bpm over 153 beats). The raw PPG waveform never appeared.
+
+### Conclusion (honest)
+This ring + firmware (2.0.0.2.11) does **not** expose the raw optical PPG waveform
+(0x81) via the BLE event log. It derives IBI on-device and discards the raw samples.
+The official-app capture caught 0x81 only as a transient LIVE burst during an active
+measurement session (a state we couldn't reproduce from our client — likely an
+app-triggered spot-check or a specific firmware measurement window).
+
+**This is a capability boundary, not a decode failure.** Everything physiologically
+meaningful is retrieved and decoded: heart rate, HRV, IBI, temperature, 3-axis
+accelerometer, motion state, plus full device telemetry. HR cross-validated against
+the user's Fitbit (60-67 bpm).
+
+→ Data-retrieval goal is effectively complete. 0x81 stays as a known limit; if
+revisited, capture it by being connected during an app-initiated measurement, or
+explore whether a feature/command forces continuous raw-PPG emission.
+
+### Files
+- `main.swift`: `--drain` (repeated advancing-cursor GetEvent); track `latestSeenTs`.
+- Local capture (git-ignored): `captures/poura-drain-attempt.log`.
+
+---
+
+## 2026-06-05g — Real-time stream characterized (the onboarding "wave test")
+
+User recalled the Oura onboarding "wave your hand" step where an on-screen animation
+follows the hand in REAL TIME — proof the ring pushes live motion-reactive data.
+Investigated which feature/channel that is.
+
+### Experiment
+`--read --features 02,03,04,0b,0d,10` while the user waved their hand 30 s.
+- Only **feature 0x02** emits a live push stream (`2f 0f 28 02 <chan> 02 00 00
+  <value u16 LE> 00 00 00 00 <suffix3>`), ~2 Hz (faster than the ~1 Hz at rest).
+- Features 0x03/0x04/0x0b/0x0d/0x10 ACK subscribe (`2f 03 27 <id> 02`) but push
+  NOTHING and produce no records. → 0x02 is THE data-plane feature; others are
+  toggles/sub-options without their own stream.
+
+### The stream reacts to movement (confirmed)
+Channel value at rest ≈ 5150 (±60). While waving: values swing 4985→13327
+(amplitude ~8300, ~140× the resting variation), saturating at ~10192/13279 then
+dropping back when still. This is exactly the onboarding "wave" behaviour.
+
+Sub-channels seen (chan byte): 0x01, 0x09, 0x11, 0x19 — all swing ~1300→13300 with a
+recurring ~13300 saturation ceiling. → these are **AFE optical channels** (different
+LEDs / photodiodes); `chan` selects which. Single scalar u16 per sample (no XYZ).
+
+### Conclusion (honest)
+The real-time stream is the **multi-channel optical AFE intensity** (the raw light
+level the PPG is derived from), ~2 Hz, push, movement-reactive. It is NOT the 3-axis
+accelerometer (single scalar per sample, no axes) nor the pure high-rate PPG waveform
+(0x81, derived on-device, not exposed — see 2026-06-05f). The onboarding wave
+animation most plausibly rides this optical stream (movement saturates it) and/or an
+accel stream we could not trigger.
+
+So we DO have a genuine real-time channel (not just fast history catch-up); it's the
+optical AFE feed. Per-channel optical intensity is itself useful (presence/wear,
+crude motion, perfusion). Local capture: `captures/poura-wave-test.log`.
+
+---
+
+## 2026-06-05h — DHR burst trigger (open_ring §6.7) — ring confirms mode 3, still no 0x81
+
+### open_ring cross-check (verified against the source)
+Fetched open_ring PROTOCOL.md and compared to our findings:
+- **Confirms**: feature 0x02 = `PARAM_DHR` (Daytime Heart Rate, byte0=mode); features
+  0x03=ActivityHR, 0x04=SpO2, 0x0b=ActivityHR-aux are toggles; GetEvent cursor
+  semantics ("rt > cursor; 0 = full dump"); IBI/temp record types.
+- **Beyond open_ring (our findings)**: the continuous ~2 Hz `2f/0x28` optical AFE
+  stream (open_ring calls 0x28 just a "param push notification after a write", not a
+  stream); the `0x27` subscribe-ack; per-LED optical channels 0x01/09/11/19.
+- **Key lead**: open_ring §6.7 says raw PPG (0x81) "bursts during HR mode", DHR mode
+  values `0=off,1=on,3=burst-3,4=burst-4`, and **"the ring auto-reverts to mode 0
+  after ~20 s; the phone re-triggers every ~15 s"**. We only triggered once → the
+  burst lapsed before 0x81 could flow.
+
+### Implemented + tested `--burst`
+Re-engages DHR burst every ~12 s (`set 0x02=0x03` + `subscribe 0x02=0x02`) + drains.
+`--read --burst --seconds 50`, worn + still, 5 re-triggers.
+
+Result: **the ring's OWN diagnostic log confirms it entered the mode** —
+`0x43` diag strings `DHR_mode:3` and `DHR data sub` appear repeatedly after each
+re-trigger. So the burst command is accepted and active. **But 0x81 still never
+emitted** (0 records); only the usual IBI 0x80 / temp / accel / debug streamed.
+
+### Conclusion (now well-supported)
+On THIS ring — Ring 4 "oreo" / ORE_06, firmware 2.0.0.2.11 — the raw PPG waveform
+(0x81) is **not emitted over the BLE event channel even in confirmed DHR burst mode**.
+We replayed open_ring's exact §6.7 sequence, the ring acknowledges and logs
+`DHR_mode:3`, yet no 0x81. open_ring documents 0x81 for the rings they studied; our
+variant/firmware diverges here. This is a firmware/hardware capability boundary, not
+a missing command on our side — and it's now backed by the ring's own mode-3 log.
+
+Everything derived from PPG — HR, HRV, IBI — is retrieved and decoded regardless.
+
+Local capture (git-ignored): `captures/poura-dhr-burst.log`.

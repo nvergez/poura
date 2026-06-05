@@ -36,3 +36,7 @@ research/jadx-out/
 research/*decompile*.log
 research/oura-apk/
 *.smali
+
+# Claude Code harness internal artifacts (not part of the project)
+.claude/scheduled_tasks.lock
+.claude/*.lock
