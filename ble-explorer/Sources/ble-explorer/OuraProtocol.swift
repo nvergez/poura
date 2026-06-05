@@ -188,6 +188,18 @@ enum OuraProtocol {
             let code = data.count >= 3 ? data[data.index(data.startIndex, offsetBy: 2)] : 0xFF
             return ("setauthkey", Data([code]))
         }
+        // GetFirmwareVersion response: request tag 0x08 → response tag 0x09.
+        // Frame: [0x09][len][body…]; body is the version blob (often ASCII-ish).
+        if first == 0x09 {
+            let body = data.count >= 2 ? data.suffix(from: data.index(data.startIndex, offsetBy: 2)) : Data()
+            return ("firmware", Data(body))
+        }
+        // GetProductInfo response: request tag 0x18 → response tag 0x19 (carries
+        // hw type "ORE_06", build id, serial — see CAPTURE_ANALYSIS.md frames 900-920).
+        if first == 0x19 {
+            let body = data.count >= 2 ? data.suffix(from: data.index(data.startIndex, offsetBy: 2)) : Data()
+            return ("productinfo", Data(body))
+        }
         return ("raw", data)
     }
 

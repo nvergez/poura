@@ -58,6 +58,7 @@ enum Mode {
     case byName(substring: String)
     case takeover         // scan ring (pairing mode) → bond → SetAuthKey(ours) → Authenticate
     case auth(key: Data)  // reconnect → GetAuthNonce → Authenticate with our saved key
+    case firmware(key: Data) // authenticate, then READ firmware version + product info (no writes)
     case reset(key: Data) // authenticate with our key, then ResetMemory (give the ring back)
     case read(key: Data, seconds: Double, history: Bool, features: [UInt8]) // auth → read infos → subscribe → stream
     case storeKey(key: Data) // migrate a key into the macOS Keychain, no BLE
@@ -134,6 +135,15 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
                 mode = .auth(key: k)
             } else {
                 FileHandle.standardError.write(Data("--auth: provide a 32-hex key or store one first (--store-key)\n".utf8))
+                exit(2)
+            }
+        case "--firmware":
+            if i + 1 < args.count, let k = hexToData(args[i + 1]) {
+                mode = .firmware(key: k); i += 1
+            } else if let k = Keychain.loadAuthKey() {
+                mode = .firmware(key: k)
+            } else {
+                FileHandle.standardError.write(Data("--firmware: provide a 32-hex key or store one first (--store-key)\n".utf8))
                 exit(2)
             }
         case "--reset":
@@ -281,13 +291,16 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             log("[ble] Peripheral \(uuid) not cached; scanning to find it (waiting for a strong-enough advert)…")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        case .ouraOnly, .takeover, .auth, .reset, .read:
+        case .ouraOnly, .takeover, .auth, .firmware, .reset, .read:
             if case .takeover = mode {
                 log("[takeover] ⚠️ This will SET OUR OWN auth_key on the ring. Only run on a FACTORY-RESET ring.")
                 log("[takeover] Put the ring in PAIRING MODE: remove from charger and put it back (white blinking light).")
             }
             if case .auth = mode {
                 log("[auth] Persistence test: reconnect → authenticate with our saved key.")
+            }
+            if case .firmware = mode {
+                log("[firmware] Read-only: authenticate with our saved key → query firmware version + product info. No writes to ring config.")
             }
             if case .reset = mode {
                 log("[reset] ⚠️ This will AUTHENTICATE then FACTORY-RESET the ring (give it back). Data on the ring is erased.")
@@ -360,7 +373,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                            peripheral.identifier.uuidString, RSSI.intValue, advName, svcs,
                            mfg.isEmpty ? "" : "  mfg=[\(mfg)]"))
             }
-        case .ouraOnly, .takeover, .auth, .reset, .read:
+        case .ouraOnly, .takeover, .auth, .firmware, .reset, .read:
             let advertisesOura = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(ouraServiceUUID) ?? false
             if advertisesOura || advName.lowercased().contains("oura") {
                 log("[ble] Found candidate Oura device: \(advName) [\(peripheral.identifier.uuidString)] rssi=\(RSSI.intValue) connectable=\(connStr)")
@@ -463,21 +476,23 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     var isTakeover: Bool { if case .takeover = mode { return true } else { return false } }
     var isAuthOnly: Bool { if case .auth = mode { return true } else { return false } }
+    var isFirmware: Bool { if case .firmware = mode { return true } else { return false } }
     var isReset: Bool { if case .reset = mode { return true } else { return false } }
     var isRead: Bool { if case .read = mode { return true } else { return false } }
-    var isHandshake: Bool { isTakeover || isAuthOnly || isReset || isRead }
-    var handshakeTag: String { isTakeover ? "takeover" : (isReset ? "reset" : (isRead ? "read" : "auth")) }
+    var isHandshake: Bool { isTakeover || isAuthOnly || isFirmware || isReset || isRead }
+    var handshakeTag: String { isTakeover ? "takeover" : (isReset ? "reset" : (isFirmware ? "firmware" : (isRead ? "read" : "auth"))) }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard isHandshake, characteristic == notifyChar else { return }
-        let tag = isTakeover ? "takeover" : "auth"
+        let tag = handshakeTag
         if let error { log("[\(tag)] Failed to enable notifications: \(error.localizedDescription)"); exit(1) }
         guard takeoverStep == .idle else { return }
         takeoverStep = .notifyEnabled
 
-        // auth, reset & read: authenticate first with the saved key (skip SetAuthKey).
+        // auth, firmware, reset & read: authenticate first with the saved key (skip SetAuthKey).
         var savedKey: Data? = nil
         if case .auth(let k) = mode { savedKey = k }
+        if case .firmware(let k) = mode { savedKey = k }
         if case .reset(let k) = mode { savedKey = k }
         if case .read(let k, _, _, _) = mode { savedKey = k }
         if let key = savedKey {
@@ -513,7 +528,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         if isHandshake, characteristic == notifyChar {
             guard let data = characteristic.value else { return }
             let parsed = OuraProtocol.parseNotification(data)
-            log("[takeover]   notify: \(hex(data))  → \(parsed.kind)")
+            log("[\(handshakeTag)]   notify: \(hex(data))  → \(parsed.kind)")
             handleTakeoverNotification(parsed, peripheral: peripheral)
             return
         }
@@ -568,6 +583,23 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         self.central.cancelPeripheralConnection(peripheral)
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
                     }
+                } else if isFirmware {
+                    // Authenticated — now READ firmware version + product info. No writes
+                    // touch ring config; these are pure queries (0x08 / 0x18).
+                    log("[firmware] → GetFirmwareVersion (0x08) + GetProductInfo (0x18) sub-queries…")
+                    fwQueriesSent = true
+                    // 0x18 sub-queries seen in the capture (frames 897-917): hw type,
+                    // build id, serial, etc. 0x14/0x18/0x28/0x34/0x04/0x08.
+                    let productSubs: [UInt8] = [0x14, 0x18, 0x28, 0x34, 0x04, 0x08]
+                    fwPendingResponses = 1 + productSubs.count   // 0x08 + each 0x18 sub
+                    write(OuraProtocol.getFirmwareVersion())
+                    for sub in productSubs { write(OuraProtocol.getProductInfo(sub: sub)) }
+                    // Grace timeout: the ring may not answer every sub; exit after a window.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                        guard let self, self.takeoverStep != .done else { return }
+                        self.log("[firmware] (done waiting for responses)")
+                        self.finishTakeover(peripheral, success: true)
+                    }
                 } else {
                     finishTakeover(peripheral, success: true)
                 }
@@ -576,6 +608,12 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 log("[\(handshakeTag)] ❌ Authenticate failed (code=0x\(String(format: "%02x", code)) = \(meaning)).")
                 finishTakeover(peripheral, success: false)
             }
+        case "firmware":
+            log("[firmware] 📟 FirmwareVersion (0x09): hex=[\(hex(parsed.payload))]  ascii=\"\(ascii(parsed.payload))\"")
+            fwResponseReceived(peripheral)
+        case "productinfo":
+            log("[firmware] ℹ️  ProductInfo (0x19): hex=[\(hex(parsed.payload))]  ascii=\"\(ascii(parsed.payload))\"")
+            fwResponseReceived(peripheral)
         case "raw":
             // In reset mode, a 1b… response is the ResetMemory ack.
             if isReset, resetSent, parsed.payload.first == 0x1B {
@@ -585,7 +623,20 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             break
         }
     }
+
+    /// Count down firmware/product-info responses; finish once all expected replies arrive.
+    func fwResponseReceived(_ peripheral: CBPeripheral) {
+        guard isFirmware, fwQueriesSent else { return }
+        fwPendingResponses = max(0, fwPendingResponses - 1)
+        if fwPendingResponses == 0 {
+            log("[firmware] ✅ All queries answered.")
+            finishTakeover(peripheral, success: true)
+        }
+    }
     var resetSent = false
+    // Firmware-read mode: track outstanding queries so we exit once they've answered.
+    var fwQueriesSent = false
+    var fwPendingResponses = 0
 
     // MARK: - Read sequence (post-auth)
 
@@ -866,7 +917,10 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard takeoverStep != .done else { return }
         takeoverStep = .done
         if success {
-            if isAuthOnly {
+            if isFirmware {
+                log("\n[firmware] ✅ Done. The version/build values are logged above (hex + ascii).")
+                log("[firmware] Note: this read NOTHING into ring config — your takeover/auth state is unchanged.")
+            } else if isAuthOnly {
                 log("\n[auth] ✅ PERSISTENCE CONFIRMED — the ring remembered our key. We can re-authenticate anytime.")
             } else if isTakeover {
                 let hexKey = hex(myAuthKey).replacingOccurrences(of: " ", with: "")
