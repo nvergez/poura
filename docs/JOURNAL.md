@@ -320,11 +320,10 @@ TLV records.**
 
 **Simple infos (request → response tag = request opcode + 1):**
 - `GetFirmwareVersion (0x08 03 00 00 00)` → `09 …`: firmware bytes
-  `02 00 00 02 0b …` → version **2.0.0.2.11** family.
-- `GetBatteryLevel (0x0C 00)` → `0d 06 60 …`: `0x60 = 96%`.
+  `xx xx xx xx xx …` → decoded to a dotted version string.
+- `GetBatteryLevel (0x0C 00)` → `0d 06 <pct> …`: pct byte = battery percentage.
 - `GetProductInfo (0x18 03 <sub> 00 10)` → `19 11 00 …` ASCII identity:
-  `9131`, **`ORE_06`** (codename oreo), serial **`2016092441019131`**
-  (= the ring's BLE name).
+  **`ORE_06`** (codename oreo) + the per-unit serial (= the ring's BLE name).
 
 **Post-auth init acks observed:** `17`=SetBleMode, `13`=SyncTime (body carries the
 ring's current ringTimestamp, e.g. `0x00057640`), `1d`=SetNotification,
@@ -353,7 +352,7 @@ cleanly (counters increment 1393,1394,1395…). Types seen in this dump:
 | `0x61` | event | binary event/counter records |
 
 `0x43` diagnostic strings decoded from the boot log:
-`git;29df664` (fw commit), `SNH;019131`+`SNL;2016092441` (serial halves),
+`git;<commit>` (fw commit), `SNH;<redacted>`+`SNL;<redacted>` (serial halves),
 `HWID;ORE_06`, `acm_bma456` (**accelerometer = Bosch BMA456**), `MFC;500;4`,
 `rdata init`, `in_bed=0`, plus charge telemetry `chgv;…`, `chg_hs;…`, `chg_rp;…`,
 `FGdcap;39`, `BMVbI;50`.
@@ -470,7 +469,7 @@ the SyncTime ack, subtracts a small window (~0x2000 ticks), and fetches from the
 
 `--read --cursor recent` on the worn ring returned (one 12 s run):
 - **0x80 IBI-quality × 42**, **0x60 IBI+amp × 47** (heart-rate data)
-- **0x46 temperature × 11** — decoded cleanly: `[25.8, 28.0, 21.4]°C` (skin / internal
+- **0x46 temperature** — decoded cleanly as 3× °C values (skin / internal
   / ambient), stable and physiologically plausible. ✅
 - **0x47 motion × 11**, plus 0x42 anchor, 0x45 state, 0x5b/0x5d/0x6c/0x72/0x82/0x83.
 
@@ -499,12 +498,12 @@ L231/L417), and capture 0x81 raw PPG in a longer recent-cursor pull. Then HR/HRV
 
 ---
 
-## 2026-06-05d — ❤️ HEART RATE decoded (67 bpm) — IBI bit-packing cracked
+## 2026-06-05d — ❤️ HEART RATE decoded — IBI bit-packing cracked
 
 Cracked the IBI payload format. A sub-agent tried multiple unpackings against our
 real 0x80/0x60 records and cross-checked open_ring's `decoders.py`; the winning
-scheme is coherent (smooth beat-to-beat, ~63-70 bpm) and matches between 0x80 and
-0x60 independently.
+scheme is coherent (smooth beat-to-beat, plausible resting-HR range) and matches
+between 0x80 and 0x60 independently.
 
 ### Verified layout
 **0x80 (green-LED IBI quality)** — N pairs of bytes:
@@ -518,16 +517,17 @@ b_high ≥ 0xE9 → gap/marker sentinel (skip)
 the 0-7 ms fine bits and the amp shift (see `OuraProtocol.ibiValues`).
 
 My earlier `w & 0x07FF` on a u16 LE was WRONG (gave 100↔1900 ms jumps). The correct
-`(b_low<<3)|(b_high&0x07)` gives e.g. `866 881 892 982 1010 983 1056 ms`.
+`(b_low<<3)|(b_high&0x07)` gives a smooth sequence of plausible IBI values (ms).
 
 ### Result on the worn ring (no Oura app)
 `--read --cursor recent --seconds 30`:
 ```
-❤️  HEART RATE: 67 bpm  (mean IBI 896 ms over 48 beats)  HRV(RMSSD)=109 ms
+❤️  HEART RATE: NN bpm  (mean IBI NNN ms over N beats)  HRV(RMSSD)=NN ms
 ```
-- **67 bpm** — matches the user's Fitbit (60-70 bpm) → externally validated.
-- IBI varies 757→1115 ms within the window = normal respiratory sinus arrhythmia.
-- Skin temp ~28-29°C stable (0x46, decoded earlier).
+- The reported **HR** matched an independent wrist monitor worn at the same time →
+  externally validated.
+- IBI varies beat-to-beat within the window = normal respiratory sinus arrhythmia.
+- Skin temperature reads as a stable value (0x46, decoded earlier).
 
 ### Added
 - `OuraProtocol`: correct 0x80 + 0x60 IBI decoders; `ibiValues()` (clean ms array);
@@ -566,7 +566,7 @@ everything the ring emits is human-readable.
 | 0x82/0x83 | scan-start/end | feature/reason/metric + result |
 
 ### 0x61 sub-types decoded (high-value)
-- `battery pct/mv/reason`, `fuel pct=96.35% mv=…` (precise fuel gauge),
+- `battery pct/mv/reason`, `fuel pct/mv` (precise fuel gauge),
 - `sleep deep/sleep/awake ticks`, `ble fast/slow/adv`, `flash read/write/erase`,
 - `period ticks/systime`, `ppgQ snr/ac/dc/ibiQ` (PPG signal quality, bit-packed),
 - **`afe chip=MAX86178`** → the ring's optical PPG sensor is the Maxim **MAX86178**.
@@ -600,11 +600,11 @@ ringTimestamp seen (cursor advances) to pull records as the worn ring generates 
 — vs the single start-of-session fetch.
 
 Ran `--read --drain --seconds 60` (worn, still). **24 GetEvent calls, 0× 0x81.**
-Everything else streamed normally (122× 0x61, 20× 0x80 IBI, 10× 0x47 accel, temp,
-HRV…; HR 60 bpm over 153 beats). The raw PPG waveform never appeared.
+Everything else streamed normally (0x61 telemetry, 0x80 IBI, 0x47 accel, temp,
+HRV…). The raw PPG waveform never appeared.
 
 ### Conclusion (honest)
-This ring + firmware (2.0.0.2.11) does **not** expose the raw optical PPG waveform
+This ring + firmware does **not** expose the raw optical PPG waveform
 (0x81) via the BLE event log. It derives IBI on-device and discards the raw samples.
 The official-app capture caught 0x81 only as a transient LIVE burst during an active
 measurement session (a state we couldn't reproduce from our client — likely an
@@ -613,7 +613,7 @@ app-triggered spot-check or a specific firmware measurement window).
 **This is a capability boundary, not a decode failure.** Everything physiologically
 meaningful is retrieved and decoded: heart rate, HRV, IBI, temperature, 3-axis
 accelerometer, motion state, plus full device telemetry. HR cross-validated against
-the user's Fitbit (60-67 bpm).
+an independent wrist monitor.
 
 → Data-retrieval goal is effectively complete. 0x81 stays as a known limit; if
 revisited, capture it by being connected during an app-initiated measurement, or
@@ -687,7 +687,7 @@ re-trigger. So the burst command is accepted and active. **But 0x81 still never
 emitted** (0 records); only the usual IBI 0x80 / temp / accel / debug streamed.
 
 ### Conclusion (now well-supported)
-On THIS ring — Ring 4 "oreo" / ORE_06, firmware 2.0.0.2.11 — the raw PPG waveform
+On THIS ring — Ring 4 "oreo" / ORE_06 — the raw PPG waveform
 (0x81) is **not emitted over the BLE event channel even in confirmed DHR burst mode**.
 We replayed open_ring's exact §6.7 sequence, the ring acknowledges and logs
 `DHR_mode:3`, yet no 0x81. open_ring documents 0x81 for the rings they studied; our

@@ -98,7 +98,7 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
   ringTimestamp (`10 09 <recent cursor> 00 ffffffff`). Cursor 0 only replays the
   old boot/charge log. Our `--read --cursor recent` reads ring-now from the SyncTime
   ack and fetches recent records → on the worn ring this returns IBI (0x80/0x60),
-  temp (0x46, decoded `[25.8, 28.0, 21.4]°C`), motion (0x47). IBI bit-packing +
+  temp (0x46, decoded as 3× °C values), motion (0x47). IBI bit-packing +
   0x81 PPG delta decode still TODO.
 - **Live**: records as notifications, bursts ≤247 B/ATT value, latency ≤~300 ms.
 - **Batch history**: `GetEvent (0x10 → 0x11)` retrieves flash history by
@@ -106,7 +106,7 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
   `10 09 <cursor u32 LE> <max_events u8> <flags u32 LE = FFFFFFFF>`.
   `cursor=0` = full dump; `max_events=0` = ack-only (advance cursor without data).
 - **Simple infos (req → resp tag = req opcode+1):** `GetFirmwareVersion 08 03 000000`
-  → `09…`; `GetBatteryLevel 0c 00` → `0d 06 <pct> …` (`0x60`=96%);
+  → `09…`; `GetBatteryLevel 0c 00` → `0d 06 <pct> …` (pct = battery byte);
   `GetProductInfo 18 03 <sub> 00 10` → `19 11 00 <ASCII>` (`ORE_06`, serial, …).
 - **Outer frame**: `[op:1][len:1][body]`.
 - **Inner records (TLV)** — ✅ decoder validated on our dump:
@@ -122,7 +122,7 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
 | `0x42` | ✅ time-sync anchor — payload = unix ts LE |
 | `0x43` | ✅ **diag-log ASCII** (`git;…`, `HWID;ORE_06`, `acm_bma456`, `chgv;…`) |
 | `0x45` | ✅ state-change: byte0 flag + ASCII name (`hr enable`, `motion det`…) |
-| `0x46` | ✅ **temperature** 3× i16 LE /100 °C (`[25.8, 28.0, 21.4]`) |
+| `0x46` | ✅ **temperature** 3× i16 LE /100 °C |
 | `0x47` | ✅ **3-axis accelerometer** int8×8 (`accel=(-816,-328,136)`) |
 | `0x50` | ✅ activity-info (byte0 class; bins opaque) |
 | `0x5b` | ✅ ble-conn telemetry (sub-dispatch; fields inferred) |
@@ -142,9 +142,9 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
 > open_ring's §6.7 DHR-burst trigger (`set 0x02=0x03` + `subscribe 0x02=0x02`,
 > re-sent every ~12 s since the ring auto-reverts after ~20 s). The ring's own diag
 > log **confirms `DHR_mode:3`** (burst active), yet 0x81 is still never emitted over
-> BLE. → firmware/hardware boundary on this variant (oreo / ORE_06, fw 2.0.0.2.11),
-> not a missing command. Everything derived from PPG — HR, HRV, IBI — works; HR
-> cross-validated vs the user's Fitbit (60–67 bpm).
+> BLE. → firmware/hardware boundary on this variant (oreo / ORE_06), not a missing
+> command. Everything derived from PPG — HR, HRV, IBI — works; HR cross-validated vs
+> an independent wrist monitor.
 
 ### Real-time stream vs open_ring
 open_ring confirms our auth, GetEvent/cursor, feature IDs (0x02=DHR, 0x03/04/0b

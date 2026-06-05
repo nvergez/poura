@@ -104,7 +104,7 @@ proof = 16 bytes. Per research: `proof = AES_128_ECB(auth_key, nonce ‖ 0x01)`.
 empirically after we set OUR key.)
 
 ## Ring identity (from GetProductInfo responses, frames 900-920)
-- 900: `19 11 00 39313331 4f52455f3036 …` = ASCII "9131" + "ORE_06"
+- 900: `19 11 00 <serial-redacted> 4f52455f3036 …` = ASCII serial + "ORE_06"
 - 904: `19 11 00 4f52455f3036 …` = "ORE_06"
 - 916/920: "<build-id-redacted>" / "<serial-redacted>" — firmware/build ids
 → Hardware type "ORE_06" maps to codename **oreo** → **this ring is "oreo"**

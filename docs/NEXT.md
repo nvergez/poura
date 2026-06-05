@@ -18,8 +18,8 @@ data stream from the worn ring. The ring currently trusts OUR key.
 - Read everything: `.build/debug/ble-explorer --read --history --seconds 30`.
 
 ### What `--read` already does (verified, see JOURNAL 2026-06-05 + 2026-06-05b)
-- Infos: battery 96%, firmware 2.0.0.2.11, product `ORE_06` / serial
-  `2016092441019131`. Resp tag = req opcode+1 (`0x09/0x0d/0x19`).
+- Infos: battery %, firmware version, product `ORE_06` / serial read directly.
+  Resp tag = req opcode+1 (`0x09/0x0d/0x19`).
 - Post-auth init: `SetBleMode 16 01 02` → `SyncTime` → `SetNotification 1c 01 bf`.
 - **Feature subscribe = measurement trigger**: `2f 03 22 02 03` (set) +
   `2f 03 26 02 02` (subscribe) → ring ACKs `2f 03 27 02 00` and starts streaming.
@@ -42,8 +42,9 @@ ack and fetches from there.
 
 ## ✅ DONE: heart rate + HRV. IBI bit-packing cracked & externally validated.
 
-`--read --cursor recent` prints `❤️ HEART RATE: NN bpm … HRV(RMSSD)=NN ms`. Verified:
-67 bpm matched the user's Fitbit. Layout (in `OuraProtocol.ibiValues`):
+`--read --cursor recent` prints `❤️ HEART RATE: NN bpm … HRV(RMSSD)=NN ms`. The HR
+was externally cross-validated against an independent wrist monitor. Layout (in
+`OuraProtocol.ibiValues`):
 - 0x80: pairs → `ibi_ms = (b_low<<3)|(b_high&0x07)`, b_high≥0xE9 = sentinel.
 - 0x60: 6×(IBI, amp), bytes 0-5 IBI high + bytes 12-13 fine bits / amp shift.
 
@@ -51,7 +52,7 @@ ack and fetches from there.
 
 HR/HRV/temp/3-axis accel/HRV-windows/motion-state/named events + device telemetry
 (fuel gauge, sleep/ble/flash stats, PPG signal quality, HW IDs). See PROTOCOL.md
-table. HR cross-validated vs the user's Fitbit (60-67 bpm).
+table. HR cross-validated vs an independent wrist monitor.
 
 ## Only remaining: raw PPG waveform (0x81)
 
