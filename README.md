@@ -33,10 +33,16 @@ and authenticates. The official Oura app can no longer reclaim the ring (it ente
   (`0x42`, unix ts), **ASCII diag logs** (`0x43`: `git;…`, `HWID;ORE_06`,
   `acm_bma456`…), events (`0x61`). Decoder validated on our own data.
 - **Biosignals via `--cursor recent`** (GetEvent from a recent ringTimestamp, not
-  cursor 0): **heart rate ❤️ 67 bpm + HRV(RMSSD) over 48 beats** (matches the user's
-  Fitbit), **temperature** ~28°C skin (0x46), **IBI** (0x80/0x60, bit-packing
-  verified), **motion** (0x47).
-- ⏳ Raw PPG waveform (`0x81`, delta-encoded) still TODO — HR/HRV already work.
+  cursor 0): **heart rate ❤️ 60-67 bpm + HRV(RMSSD)** (matches the user's Fitbit),
+  **temperature** ~28°C skin (0x46), **IBI** (0x80/0x60), **3-axis accelerometer**
+  (0x47), **HRV windows** (0x5d), **motion state** (0x6b), **named sensor events**
+  (0x45 `hr enable`…).
+- **Nearly all record types decoded** (0x41/42/43/45/46/47/50/5b/5d/60/61/6b/6c/72/
+  75/80/82/83): plus device telemetry from `0x61` sub-types — precise **fuel gauge**
+  (96.35%), **sleep/ble/flash stats**, **PPG signal quality** (SNR/AC/DC), and HW IDs
+  (**PPG sensor = Maxim MAX86178**, accel = Bosch BMA456).
+- ⏳ Raw PPG waveform (`0x81`, delta-encoded) — only one left; not retained in our
+  ring's retrievable event log (it derives IBI on-device). HR/HRV already work.
 
 ### Next
 - Decode raw PPG waveform (0x81) for a full optical trace.

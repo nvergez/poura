@@ -541,3 +541,52 @@ My earlier `w & 0x07FF` on a u16 LE was WRONG (gave 100↔1900 ms jumps). The co
 - 0x81 raw PPG waveform (delta-encoded) — didn't land in these windows; capture +
   decode for a true PPG trace. The IBI/HR path above already gives HR + HRV, which
   is the main physiological signal.
+
+---
+
+## 2026-06-05e — Decoded the FULL record inventory (12 more types) via multi-agent workflow
+
+Ran an 8-agent workflow (each decoding one record family from our real captured
+payloads + open_ring cross-check) → consolidated into Swift decoders. Now nearly
+everything the ring emits is human-readable.
+
+### Newly decoded (verified live on the worn ring)
+| Type | Name | Real example from our ring |
+|------|------|----------------------------|
+| 0x45 | state-change | `state="hr enable"` — named sensor-mode events |
+| 0x47 | motion | `accel=(-816,-328,136)` — 3-axis accelerometer (int8×8) |
+| 0x50 | activity-info | `class=0` + opaque intensity bins |
+| 0x5b | ble-conn | BLE link telemetry (sub-dispatch; fields inferred) |
+| 0x5d | hrv | N×(HR bpm, RMSSD ms) per 5-min window |
+| 0x61 | debug-data | sub-dispatch: battery/sleep/fuel/ble/flash/period/PPG-quality |
+| 0x6b | motion-period | `NO_MOTION/RESTLESS/TOSSING/ACTIVE` (low 2 bits) |
+| 0x6c | feature-session | feature_id/capability/status |
+| 0x72 | sleep-acm | 6× u16 LE activity metrics |
+| 0x75 | sleep-temp | N× i16 LE /100 °C trace |
+| 0x82/0x83 | scan-start/end | feature/reason/metric + result |
+
+### 0x61 sub-types decoded (high-value)
+- `battery pct/mv/reason`, `fuel pct=96.35% mv=…` (precise fuel gauge),
+- `sleep deep/sleep/awake ticks`, `ble fast/slow/adv`, `flash read/write/erase`,
+- `period ticks/systime`, `ppgQ snr/ac/dc/ibiQ` (PPG signal quality, bit-packed),
+- **`afe chip=MAX86178`** → the ring's optical PPG sensor is the Maxim **MAX86178**.
+- Accelerometer earlier identified as Bosch **BMA456** (0x43 diag `acm_bma456`).
+
+### Honesty
+Decoders are defensive (length-guarded, raw hex alongside any interpretation).
+VERIFIED vs INFERRED vs OPAQUE per field is in the workflow report. Notable: 0x45
+byte0 is a counter/flag (not open_ring's state enum); 0x6b uses low-2-bits (open_ring
+full-byte read is broken on real data); 0x72 is 6×u16 (not open_ring's 6×u8).
+
+### Raw PPG (0x81) — still not captured
+Probed recent + older cursors (ring_now, −0x10000…−0x30000): segments hold IBI/temp/
+motion/debug but NO 0x81. Conclusion: our ring derives IBI on-device and doesn't
+retain the raw PPG waveform in the retrievable event log (the app's capture caught
+0x81 live during an active measurement burst, ringTs in session 5392). HR/HRV/temp/
+accel — the meaningful physiology — are all working. 0x81 would need catching the
+live high-rate burst; left as the one remaining TODO.
+
+### Files
+- `OuraProtocol.swift`: 12 new decode cases + `decodeDebugData0x61` + `hexc` helper;
+  extended `recordTypeName`.
+- Local capture (git-ignored): `captures/poura-all-types.log`.

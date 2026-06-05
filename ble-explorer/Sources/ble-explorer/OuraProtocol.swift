@@ -214,11 +214,20 @@ enum OuraProtocol {
         case 0x46: return "temp"          // 3× i16 LE /100 = °C
         case 0x47: return "motion"        // compact 3-axis accel
         case 0x53: return "wear-state"
+        case 0x50: return "activity-info"
+        case 0x5b: return "ble-conn"
+        case 0x5d: return "hrv"           // N×(HR bpm, RMSSD ms) per 5-min window
         case 0x60: return "IBI+amp"       // bit-packed IBI ms + amplitude
         case 0x61: return "debug-data"    // payload[0] = sub-dispatch
+        case 0x6b: return "motion-period"
+        case 0x6c: return "feature-session"
+        case 0x72: return "sleep-acm"     // 6× u16 LE activity metrics
+        case 0x75: return "sleep-temp"    // N× i16 LE /100 °C trace
         case 0x79: return "AFE-tuning"    // [sub][idx][u16 LE samples]
         case 0x80: return "IBI-quality"
         case 0x81: return "raw-PPG"
+        case 0x82: return "scan-start"
+        case 0x83: return "scan-end"
         case 0x85: return "RTC-beacon"
         default:   return "type-0x\(String(format: "%02x", t))"
         }
@@ -329,8 +338,134 @@ enum OuraProtocol {
                 beats.append(isMarker ? "·" : "\(ibi)")
             }
             return "IBI_ms=[\(beats.joined(separator: " "))]\(hrSuffix(beats))"
+
+        // --- types decoded from real captures + open_ring (workflow 2026-06-05e) ---
+        // Defensive: print raw bytes alongside any inferred interpretation; honest
+        // VERIFIED/INFERRED/OPAQUE notes are in JOURNAL 2026-06-05e.
+        case 0x45:   // state-change: byte0=counter/flag, bytes[1...]=ASCII name.
+            guard !p.isEmpty else { return nil }
+            let name = String(decoding: p[1...], as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return "state=\"\(name)\" (byte0=\(p[0]))"
+        case 0x47:   // motion: 3-axis accel int8×8 + flag nibbles (4–6 B).
+            guard p.count >= 4 && p.count <= 6 else { return nil }
+            let x = Int(Int8(bitPattern: p[1])) * 8
+            let y = Int(Int8(bitPattern: p[2])) * 8
+            let z = Int(Int8(bitPattern: p[3])) * 8
+            return "accel=(\(x), \(y), \(z)) flags=\(p[0]>>5)/\(p[0]&0x1F)"
+        case 0x50:   // activity-info: byte0=class, rest opaque.
+            guard !p.isEmpty else { return nil }
+            return "activity class=\(p[0]) trailing=[\(hexc(Array(p.dropFirst())))] (opaque)"
+        case 0x5b:   // BLE connection telemetry. byte0=sub-dispatch. fields INFERRED.
+            guard let sub = p.first else { return nil }
+            return "ble-conn/sub=0x\(String(format: "%02x", sub)) raw=[\(hexc(p))]"
+        case 0x5d:   // HRV: N×(HR bpm, RMSSD ms) per 5-min window.
+            guard p.count >= 2, p.count <= 12, p.count % 2 == 0 else { return nil }
+            let w = stride(from: 0, to: p.count, by: 2).map { "HR=\(p[$0])bpm RMSSD=\(p[$0+1])ms" }
+            return "HRV[\(w.count)×5min]: \(w.joined(separator: ", "))"
+        case 0x61:   // debug-data: byte0=sub-dispatch (battery/sleep/fuel/PPG-quality…).
+            guard !p.isEmpty else { return nil }
+            return decodeDebugData0x61(p)
+        case 0x6b:   // motion-period: state in low 2 bits of byte0.
+            guard !p.isEmpty else { return nil }
+            let names = ["NO_MOTION", "RESTLESS", "TOSSING_TURNING", "ACTIVE"]
+            return "motion-period=\(names[Int(p[0] & 0x03)])"
+        case 0x6c:   // feature-session: byte0=feature_id, byte1=capability, byte2=status.
+            guard p.count >= 3 else { return nil }
+            return "feature=\(p[0]) capability=\(p[1]) status=\(p[2])"
+        case 0x72:   // sleep-acm: 12 B = 6× u16 LE activity metrics (labels opaque).
+            guard p.count == 12 else { return nil }
+            let v = (0..<6).map { String(UInt16(p[2*$0]) | (UInt16(p[2*$0+1]) << 8)) }
+            return "sleep-acm=[\(v.joined(separator: ", "))]"
+        case 0x75:   // sleep-temp: N× i16 LE /100 °C trace.
+            guard !p.isEmpty, p.count % 2 == 0 else { return nil }
+            let t = stride(from: 0, to: p.count, by: 2).map { i -> String in
+                let raw = Int16(bitPattern: UInt16(p[i]) | (UInt16(p[i+1]) << 8))
+                return String(format: "%.2f", Double(raw) / 100.0)
+            }
+            return "sleep-temp[\(t.count)]°C: \(t.joined(separator: ", "))"
+        case 0x82:   // scan-start: feature/reason/metric + slots.
+            guard p.count >= 3 else { return nil }
+            let slots = p.count > 3 ? Array(p[3...]).map(String.init).joined(separator: ",") : ""
+            return "scan-start feature=\(p[0]) reason=\(p[1]) metric=\(p[2]) slots=[\(slots)]"
+        case 0x83:   // scan-end: byte0=0x40 marker.
+            guard !p.isEmpty else { return nil }
+            var s = String(format: "scan-end marker=0x%02x", p[0])
+            if p.count >= 2 { s += " b1=\(p[1])" }
+            if p.count > 2 { s += " result=[\(hexc(Array(p[2...])))]" }
+            return s
         default:
             return nil
         }
+    }
+
+    /// Hex-dump helper for decode output (space-separated).
+    private static func hexc(_ b: [UInt8]) -> String {
+        b.map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
+    /// 0x61 API_DEBUG_DATA — byte0 = sub-dispatch, fields begin at byte1. High-volume
+    /// subs decoded (VERIFIED vs open_ring + sane real values); rare subs → raw hex.
+    private static func decodeDebugData0x61(_ p: [UInt8]) -> String {
+        let sub = p[0]
+        func u16(_ o: Int) -> Int { Int(p[o]) | (Int(p[o+1]) << 8) }
+        func u32(_ o: Int) -> UInt32 {
+            UInt32(p[o]) | (UInt32(p[o+1])<<8) | (UInt32(p[o+2])<<16) | (UInt32(p[o+3])<<24)
+        }
+        func i32(_ o: Int) -> Int32 { Int32(bitPattern: u32(o)) }
+        switch sub {
+        case 0x24: // BatteryLevelChanged
+            guard p.count >= 5 else { break }
+            return "0x61/battery pct=\(p[1])% mv=\(u16(2)) reason=\(p[4])"
+        case 0x09: // SleepStatistics
+            guard p.count >= 14 else { break }
+            return "0x61/sleep deep=\(u32(1)) sleep=\(u32(5)) awake=\(u32(9)) pfsm=\(p[13])"
+        case 0x14: // FuelGaugeStatistics
+            guard p.count >= 14 else { break }
+            let cc = (Int(Int8(bitPattern: p[11])) << 16) | (Int(p[12]) << 8) | Int(p[13])
+            return String(format: "0x61/fuel pct=%.2f mv=%d curr=%d remCap=%d cc=%d",
+                          Double(u16(1)) / 256.0, u16(3), Int(i32(5)), u16(9), cc)
+        case 0x0c: // PeriodInfo
+            guard p.count >= 10 else { break }
+            return "0x61/period ticks=\(u32(1)) systime_s=\(Double(u32(5))/10.0) pfsm=\(p[9])"
+        case 0x0d: // BleUsage
+            guard p.count >= 13 else { break }
+            return "0x61/ble fast=\(u32(1)) slow=\(u32(5)) adv=\(u32(9))"
+        case 0x0a: // FlashUsage
+            guard p.count >= 13 else { break }
+            return "0x61/flash read=\(u32(1)) write=\(u32(5)) erase=\(u32(9))"
+        case 0x33: // AfePpgSettings (chip id; inner regs opaque)
+            guard p.count >= 2 else { break }
+            let chips = ["MAX86171", "MAX86173", "MAX86178"]
+            let name = (1...3).contains(Int(p[1])) ? chips[Int(p[1])-1]
+                       : "unknown(0x\(String(format: "%02x", p[1])))"
+            return "0x61/afe chip=\(name) regs=[\(hexc(Array(p.dropFirst(2))))]"
+        case 0x35: // PpgSignalQuality (bit-packed by content mask)
+            guard p.count >= 5 else { break }
+            let b1 = p[1], b2 = p[2], b3 = p[3], b4 = p[4]
+            if (b2 & 0x80) != 0 || (b4 & 0x80) != 0 { return "0x61/ppgQ invalid" }
+            let cmask = b4 & 0x3F
+            var s = "0x61/ppgQ slot1=\(b1>>4) slot2=\(b1 & 0xF) tune=\(b2 & 0x7F) led=\(b3)"
+            if (b4 & 0x40) != 0 { return s + " [stateful]" }
+            var bo = 5, bi = 0
+            func read(_ n: Int) -> Int? {
+                var out = 0, c = 0
+                while c < n {
+                    if bo >= p.count { return nil }
+                    let take = min(n - c, 8 - bi)
+                    out = (out << take) | ((Int(p[bo]) >> bi) & ((1 << take) - 1))
+                    bi += take; if bi == 8 { bi = 0; bo += 1 }
+                    c += take
+                }
+                return out
+            }
+            if cmask & 0x01 != 0, let v = read(9)                  { s += " snr=\(v)" }
+            if cmask & 0x02 != 0, let sh = read(4), let v = read(8){ s += " ac=\(v << sh)" }
+            if cmask & 0x04 != 0, let v = read(15)                 { s += " dc=\(v)" }
+            if cmask & 0x20 != 0, let v = read(7)                  { s += " ibiQ=\(v)%" }
+            return s
+        default: break
+        }
+        return "0x61/0x\(String(format: "%02x", sub)) [undecoded] \(hexc(Array(p.dropFirst())))"
     }
 }
