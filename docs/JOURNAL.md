@@ -496,3 +496,48 @@ cursor `recent` resolves to ~0x5e000 and lands right on the live measurement rec
 ### Next
 Decode 0x80/0x60 IBI packing (validate against a known HR, or open_ring decoders.py
 L231/L417), and capture 0x81 raw PPG in a longer recent-cursor pull. Then HR/HRV.
+
+---
+
+## 2026-06-05d — ❤️ HEART RATE decoded (67 bpm) — IBI bit-packing cracked
+
+Cracked the IBI payload format. A sub-agent tried multiple unpackings against our
+real 0x80/0x60 records and cross-checked open_ring's `decoders.py`; the winning
+scheme is coherent (smooth beat-to-beat, ~63-70 bpm) and matches between 0x80 and
+0x60 independently.
+
+### Verified layout
+**0x80 (green-LED IBI quality)** — N pairs of bytes:
+```
+ibi_ms    = (b_low << 3) | (b_high & 0x07)   # 11-bit, milliseconds
+quality_a = (b_high >> 3) & 0x03
+quality_b = (b_high >> 5) & 0x07
+b_high ≥ 0xE9 → gap/marker sentinel (skip)
+```
+**0x60 (IBI+amplitude)** — 6×(IBI, amp); bytes 0-5 = IBI high, 6-11 = amp, 12-13 pack
+the 0-7 ms fine bits and the amp shift (see `OuraProtocol.ibiValues`).
+
+My earlier `w & 0x07FF` on a u16 LE was WRONG (gave 100↔1900 ms jumps). The correct
+`(b_low<<3)|(b_high&0x07)` gives e.g. `866 881 892 982 1010 983 1056 ms`.
+
+### Result on the worn ring (no Oura app)
+`--read --cursor recent --seconds 30`:
+```
+❤️  HEART RATE: 67 bpm  (mean IBI 896 ms over 48 beats)  HRV(RMSSD)=109 ms
+```
+- **67 bpm** — matches the user's Fitbit (60-70 bpm) → externally validated.
+- IBI varies 757→1115 ms within the window = normal respiratory sinus arrhythmia.
+- Skin temp ~28-29°C stable (0x46, decoded earlier).
+
+### Added
+- `OuraProtocol`: correct 0x80 + 0x60 IBI decoders; `ibiValues()` (clean ms array);
+  `hrSuffix()` (per-record bpm hint).
+- `main.swift`: collect all clean IBI across a run; print aggregate **HR + HRV
+  (RMSSD)** in the summary. Sentinels (b_high≥0xE9 / 0xFA / out-of-range) dropped —
+  raw IBI values are shown as-is, only non-beats are filtered.
+- Local capture (git-ignored): `captures/poura-heartrate.log`.
+
+### Remaining
+- 0x81 raw PPG waveform (delta-encoded) — didn't land in these windows; capture +
+  decode for a true PPG trace. The IBI/HR path above already gives HR + HRV, which
+  is the main physiological signal.

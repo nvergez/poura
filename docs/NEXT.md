@@ -40,14 +40,19 @@ it with `GetEvent` from a cursor near the ring's CURRENT ringTimestamp (cursor 0
 replays the old boot/charge log). `--cursor recent` reads ring-now from the SyncTime
 ack and fetches from there.
 
-## Next task: decode IBI/PPG payloads + capture 0x81
+## ✅ DONE: heart rate + HRV. IBI bit-packing cracked & externally validated.
 
-- **0x80 IBI packing** is NOT validated — bits-0..10 give incoherent ms. Currently
-  printed as raw u16 words. Validate against a known heart rate (count your pulse for
-  15 s during a run) or open_ring `decoders.py` L417/L646. Same for 0x60.
-- **0x81 raw PPG** (delta-encoded) didn't appear in a short window — do a longer
-  `--read --cursor recent --seconds 30` (or a couple of runs) to catch it, then write
-  the stateful delta decoder (0x80 marker → 3-byte abs u24; MSB-set = signed delta).
+`--read --cursor recent` prints `❤️ HEART RATE: NN bpm … HRV(RMSSD)=NN ms`. Verified:
+67 bpm matched the user's Fitbit. Layout (in `OuraProtocol.ibiValues`):
+- 0x80: pairs → `ibi_ms = (b_low<<3)|(b_high&0x07)`, b_high≥0xE9 = sentinel.
+- 0x60: 6×(IBI, amp), bytes 0-5 IBI high + bytes 12-13 fine bits / amp shift.
+
+## Next task: raw PPG waveform (0x81) — optional, HR already works
+
+- `0x81` (delta-encoded PPG) didn't land in the short windows. Do a longer/again
+  `--read --cursor recent --seconds 30`, then write the stateful delta decoder
+  (0x80 marker → 3-byte abs u24; MSB-set byte = signed delta; else 7-bit signed
+  delta). open_ring §5.4 (CVA-PPG) is the reference.
 - Optional older leads (the live-stream path, lower priority now):
   Feature 0x02 streams only a slow AFE channel (~1 Hz). Probed features
   0x02/03/04/0b/0d/10 — all ACK subscribe, only 0x02 emits. If you revisit:

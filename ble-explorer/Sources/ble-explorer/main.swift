@@ -214,6 +214,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var recordCounts: [UInt8: Int] = [:]  // per-type tally for the end-of-run summary
     var streamSampleCount = 0      // live feature-data samples (2f/0x28) seen this run
     var ringNowTimestamp: UInt32 = 0  // ring's current ringTimestamp, from the SyncTime ack
+    var allIBIms: [Int] = []          // clean beat intervals (0x80/0x60) across the run
     var readStreamSeconds: Double { if case .read(_, let s, _, _) = mode { return s } else { return 20 } }
     var readWantsHistory: Bool { if case .read(_, _, let h, _) = mode { return h } else { return false } }
     var readFeatureIDs: [UInt8] { if case .read(_, _, _, let f) = mode { return f } else { return [0x02] } }
@@ -766,6 +767,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 extra = "  unixAnchor=\(unix) (\(date))"
             } else if let bio = OuraProtocol.decodeBiosignal(r) {
                 extra = "  \(bio)"
+                allIBIms.append(contentsOf: OuraProtocol.ibiValues(r))
             }
             log(String(format: "[%@] type=0x%02x %-12@ ts=%u ses=%u ctr=%u payload(%d)=[%@]%@",
                        source, r.type, name as NSString, r.ringTimestamp, r.session, r.counter,
@@ -789,6 +791,21 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
         if !streamLeftover.isEmpty {
             log("[read]   unframed trailing bytes: [\(hex(streamLeftover))]")
+        }
+        // Aggregate heart rate / HRV from all clean IBI beats this run.
+        if allIBIms.count >= 3 {
+            let n = Double(allIBIms.count)
+            let mean = Double(allIBIms.reduce(0, +)) / n
+            let bpm = 60000.0 / mean
+            // RMSSD: root-mean-square of successive IBI differences — the standard
+            // short-term HRV metric.
+            var sq = 0.0
+            for k in 1..<allIBIms.count {
+                let d = Double(allIBIms[k] - allIBIms[k-1]); sq += d * d
+            }
+            let rmssd = (allIBIms.count > 1) ? (sq / Double(allIBIms.count - 1)).squareRoot() : 0
+            log(String(format: "\n[read] ❤️  HEART RATE: %.0f bpm  (mean IBI %.0f ms over %d beats)  HRV(RMSSD)=%.0f ms",
+                       bpm, mean, allIBIms.count, rmssd))
         }
         central.cancelPeripheralConnection(peripheral)
         delay(1) { exit(0) }

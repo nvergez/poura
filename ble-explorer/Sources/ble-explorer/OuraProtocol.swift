@@ -257,6 +257,42 @@ enum OuraProtocol {
     ///    14-15 = qual_b. A beat is "clean" when qual_a ≤ 1 and qual_b == 0.
     ///  - 0x60 IBI+amp: bit-packed 6×(11-bit IBI ms, amplitude) — left raw for now
     ///    (packing needs worn-data validation; flagged rather than guessed).
+    /// From a list of beat tokens (numeric ms or "·" markers), append a mean-HR hint
+    /// when there are enough clean beats to be meaningful.
+    static func hrSuffix(_ beats: [String]) -> String {
+        let ms = beats.compactMap { Double($0) }.filter { $0 >= 300 && $0 <= 1500 }
+        guard ms.count >= 2 else { return "" }
+        let mean = ms.reduce(0, +) / Double(ms.count)
+        return String(format: "  ~%.0f bpm", 60000.0 / mean)
+    }
+
+    /// Clean inter-beat intervals (ms) from a 0x80 or 0x60 record, sentinels dropped.
+    /// Same bit-layout as `decodeBiosignal` but returns numbers for aggregation.
+    static func ibiValues(_ r: Record) -> [Int] {
+        let p = [UInt8](r.payload)
+        var out: [Int] = []
+        if r.type == 0x80 {
+            var i = 0
+            while i + 1 < p.count {
+                if p[i+1] < 0xE9 {
+                    let ibi = Int((UInt16(p[i]) << 3) | (UInt16(p[i+1]) & 0x07))
+                    if ibi >= 300 && ibi <= 1500 { out.append(ibi) }
+                }
+                i += 2
+            }
+        } else if r.type == 0x60, p.count >= 14 {
+            let b12 = p[12], b13 = p[13]
+            let mid: [UInt16] = [UInt16((b12>>5)&6), UInt16((b12>>3)&6), UInt16((b12>>1)&6),
+                                 UInt16((b12<<1)&6), UInt16((b13>>5)&6), UInt16((b13>>3)&6)]
+            for k in 0..<6 {
+                if p[6+k] == 0xFA { continue }
+                let ibi = Int((UInt16(p[k]) << 3) | mid[k] | UInt16(p[6+k] & 1))
+                if ibi >= 300 && ibi <= 1500 { out.append(ibi) }
+            }
+        }
+        return out
+    }
+
     static func decodeBiosignal(_ r: Record) -> String? {
         let p = [UInt8](r.payload)
         switch r.type {
@@ -264,19 +300,35 @@ enum OuraProtocol {
             guard p.count >= 6 else { return nil }
             func t(_ i: Int) -> Double { Double(Int16(bitPattern: UInt16(p[i]) | (UInt16(p[i+1]) << 8))) / 100.0 }
             return String(format: "temp=[%.2f, %.2f, %.2f]°C", t(0), t(2), t(4))
-        case 0x80:   // green-LED IBI quality — 7× u16 LE. The exact bit packing of
-            // IBI-ms vs quality is NOT yet validated against ground truth (the
-            // bits-0..10 split produces incoherent intervals on real data), so we
-            // print the raw u16 words rather than asserting wrong "ms" values.
+        case 0x80:   // green-LED IBI quality — N pairs of bytes. VERIFIED layout
+            // (open_ring + coherent on our data → ~69 bpm):
+            //   ibi_ms    = (b_low << 3) | (b_high & 0x07)   # 11-bit, ms
+            //   quality_a = (b_high >> 3) & 0x03
+            //   quality_b = (b_high >> 5) & 0x07
+            // High b_high (0xe9–0xff) = gap/marker sentinel, not a real beat.
             guard p.count >= 2 else { return nil }
-            var words: [String] = []
+            var beats: [String] = []
             var i = 0
             while i + 1 < p.count {
-                let w = UInt16(p[i]) | (UInt16(p[i+1]) << 8)
-                words.append(String(format: "0x%04x", w))
+                let ibi = (UInt16(p[i]) << 3) | (UInt16(p[i+1]) & 0x07)
+                let isMarker = p[i+1] >= 0xE9
+                beats.append(isMarker ? "·" : "\(ibi)")
                 i += 2
             }
-            return "IBI-words(u16 LE, packing TBD)=[\(words.joined(separator: " "))]"
+            return "IBI_ms=[\(beats.joined(separator: " "))]\(hrSuffix(beats))"
+        case 0x60:   // IBI + amplitude — 6×(IBI ms, amplitude). VERIFIED (open_ring +
+            // ~69 bpm, matches 0x80). Mid/low bits are a 0–7 ms fine correction.
+            guard p.count >= 14 else { return nil }
+            let b12 = p[12], b13 = p[13]
+            let mid: [UInt16] = [UInt16((b12>>5)&6), UInt16((b12>>3)&6), UInt16((b12>>1)&6),
+                                 UInt16((b12<<1)&6), UInt16((b13>>5)&6), UInt16((b13>>3)&6)]
+            var beats: [String] = []
+            for k in 0..<6 {
+                let ibi = (UInt16(p[k]) << 3) | mid[k] | UInt16(p[6+k] & 1)
+                let isMarker = p[6+k] == 0xFA || ibi < 250 || ibi > 2000
+                beats.append(isMarker ? "·" : "\(ibi)")
+            }
+            return "IBI_ms=[\(beats.joined(separator: " "))]\(hrSuffix(beats))"
         default:
             return nil
         }

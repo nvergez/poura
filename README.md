@@ -12,11 +12,10 @@ data **without going through the Oura app or Oura's servers**.
 
 🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
 authenticated, **zero Oura app/cloud** in the auth path.
-🟢 **Data + biosignals retrieved** — `--read` pulls device infos, decodes the TLV
-record stream/history, and `--read --cursor recent` retrieves **real physiological
-records from the worn ring**: IBI/heart-beat (0x80/0x60), temperature (0x46,
-decoded: ~25.8°C skin), motion (0x47). All without the Oura app. Remaining: validate
-IBI bit-packing + capture raw PPG (0x81), then iOS app.
+🟢 **Heart rate retrieved** — `--read --cursor recent` reads **real heart rate from
+the worn ring, no Oura app**: e.g. `❤️ 67 bpm (over 48 beats) HRV(RMSSD)=109 ms`,
+matching the user's Fitbit. Also decodes temperature (~28°C skin) and motion.
+IBI bit-packing verified (0x80/0x60). Remaining: raw PPG waveform (0x81) + iOS app.
 
 ## Goals
 
@@ -26,21 +25,21 @@ Achieved: after a factory reset, our macOS tool sets its own `auth_key` on the r
 and authenticates. The official Oura app can no longer reclaim the ring (it enters
 "restricted mode") until a factory reset — proving the takeover holds.
 
-### Data retrieval — ✅ DONE (infos + records); biosignals in progress
-`--read` (saved-key handshake → read) verified on the real ring:
+### Data retrieval — ✅ DONE (infos + biosignals incl. heart rate)
+`--read` (saved-key handshake → read) verified on the real ring, no Oura app:
 - **Battery 96%**, **firmware 2.0.0.2.11**, **product** `ORE_06` / serial
-  `2016092441019131` — all read directly, no Oura app.
-- **TLV records decoded** (~256 in one history dump): boot (`0x41`), time-anchor
+  `2016092441019131` — read directly.
+- **TLV records decoded** (~256 in a history dump): boot (`0x41`), time-anchor
   (`0x42`, unix ts), **ASCII diag logs** (`0x43`: `git;…`, `HWID;ORE_06`,
   `acm_bma456`…), events (`0x61`). Decoder validated on our own data.
-- **Live AFE stream** from the worn ring via feature subscribe (`2f 03 26 02 02`):
-  channel 0x09 value ≈ 5150 (likely PPG DC level), reacts to finger movement.
-- ⏳ **High-rate PPG waveform** (`0x81`) + **IBI** (`0x80`) not yet streamed — only
-  feature 0x02 emits, and it's the slow AFE channel. Likely needs a scheduled
-  measurement session. See `docs/NEXT.md`.
+- **Biosignals via `--cursor recent`** (GetEvent from a recent ringTimestamp, not
+  cursor 0): **heart rate ❤️ 67 bpm + HRV(RMSSD) over 48 beats** (matches the user's
+  Fitbit), **temperature** ~28°C skin (0x46), **IBI** (0x80/0x60, bit-packing
+  verified), **motion** (0x47).
+- ⏳ Raw PPG waveform (`0x81`, delta-encoded) still TODO — HR/HRV already work.
 
 ### Next
-- Capture raw biosignals (wear ring, investigate measurement-start). 
+- Decode raw PPG waveform (0x81) for a full optical trace.
 - Port to a native iOS app (Swift / CoreBluetooth), reusing `OuraProtocol.swift`.
   Clean-room: `open_ring`/`ringverse` used only as reference docs, not as a codebase.
 
