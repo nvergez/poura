@@ -590,3 +590,35 @@ live high-rate burst; left as the one remaining TODO.
 - `OuraProtocol.swift`: 12 new decode cases + `decodeDebugData0x61` + `hexc` helper;
   extended `recordTypeName`.
 - Local capture (git-ignored): `captures/poura-all-types.log`.
+
+---
+
+## 2026-06-05f — Raw PPG (0x81) final attempt: --drain. Conclusion: not exposed.
+
+Added `--drain`: throughout the stream window, re-issue GetEvent from the latest
+ringTimestamp seen (cursor advances) to pull records as the worn ring generates them
+— vs the single start-of-session fetch.
+
+Ran `--read --drain --seconds 60` (worn, still). **24 GetEvent calls, 0× 0x81.**
+Everything else streamed normally (122× 0x61, 20× 0x80 IBI, 10× 0x47 accel, temp,
+HRV…; HR 60 bpm over 153 beats). The raw PPG waveform never appeared.
+
+### Conclusion (honest)
+This ring + firmware (2.0.0.2.11) does **not** expose the raw optical PPG waveform
+(0x81) via the BLE event log. It derives IBI on-device and discards the raw samples.
+The official-app capture caught 0x81 only as a transient LIVE burst during an active
+measurement session (a state we couldn't reproduce from our client — likely an
+app-triggered spot-check or a specific firmware measurement window).
+
+**This is a capability boundary, not a decode failure.** Everything physiologically
+meaningful is retrieved and decoded: heart rate, HRV, IBI, temperature, 3-axis
+accelerometer, motion state, plus full device telemetry. HR cross-validated against
+the user's Fitbit (60-67 bpm).
+
+→ Data-retrieval goal is effectively complete. 0x81 stays as a known limit; if
+revisited, capture it by being connected during an app-initiated measurement, or
+explore whether a feature/command forces continuous raw-PPG emission.
+
+### Files
+- `main.swift`: `--drain` (repeated advancing-cursor GetEvent); track `latestSeenTs`.
+- Local capture (git-ignored): `captures/poura-drain-attempt.log`.

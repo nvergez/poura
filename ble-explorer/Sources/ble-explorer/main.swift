@@ -32,6 +32,11 @@ setbuf(stdout, nil)
 // sequence; a global keeps it out of the already-wide Mode enum.
 var historyCursorSpec: String? = nil
 
+// `--drain`: throughout the stream window, repeatedly GetEvent from the latest seen
+// ringTimestamp to pull records (esp. raw PPG 0x81) as the worn ring generates them,
+// instead of a single start-of-session fetch.
+var drainMode = false
+
 let ouraServiceUUID = CBUUID(string: "98ed0001-a541-11e4-b6a0-0002a5d5c51b")
 let ouraWriteCharUUID = CBUUID(string: "98ed0002-a541-11e4-b6a0-0002a5d5c51b")
 let ouraNotifyCharUUID = CBUUID(string: "98ed0003-a541-11e4-b6a0-0002a5d5c51b")
@@ -96,6 +101,10 @@ func parseArgs() -> (mode: Mode, scanSeconds: Double) {
             if i + 1 < args.count {
                 historyCursorSpec = args[i + 1]; readHistory = true; i += 1
             }
+        case "--drain":
+            // Repeatedly GetEvent at the advancing cursor during the stream window.
+            drainMode = true; readHistory = true
+            if historyCursorSpec == nil { historyCursorSpec = "recent" }
         case "--features":
             // Comma/space-separated hex feature IDs to subscribe, e.g. "02,03,0b".
             if i + 1 < args.count {
@@ -215,6 +224,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var streamSampleCount = 0      // live feature-data samples (2f/0x28) seen this run
     var ringNowTimestamp: UInt32 = 0  // ring's current ringTimestamp, from the SyncTime ack
     var allIBIms: [Int] = []          // clean beat intervals (0x80/0x60) across the run
+    var latestSeenTs: UInt32 = 0      // highest ringTimestamp seen (for --drain cursor)
     var readStreamSeconds: Double { if case .read(_, let s, _, _) = mode { return s } else { return 20 } }
     var readWantsHistory: Bool { if case .read(_, _, let h, _) = mode { return h } else { return false } }
     var readFeatureIDs: [UInt8] { if case .read(_, _, _, let f) = mode { return f } else { return [0x02] } }
@@ -650,6 +660,22 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         delay(streamStart) {
             self.log("\n[read] === LIVE STREAM open for \(Int(self.readStreamSeconds))s — wear the ring, keep still for clean PPG/IBI ===")
         }
+
+        // --drain: every ~2.5 s, re-issue GetEvent from the latest ringTimestamp seen,
+        // to pull records (esp. raw PPG 0x81) as the worn ring generates them.
+        if drainMode {
+            let every = 2.5
+            var t = streamStart + 1.0
+            while t < streamStart + readStreamSeconds {
+                delay(t) {
+                    let cur = self.latestSeenTs > 0 ? self.latestSeenTs + 1 : self.resolveHistoryCursor()
+                    self.log("[read] → drain GetEvent from cursor 0x\(String(format: "%08x", cur))…")
+                    self.write(OuraProtocol.getEvent(cursor: cur), label: "read")
+                }
+                t += every
+            }
+        }
+
         // Close the stream window and summarize.
         delay(streamStart + readStreamSeconds) {
             self.finishRead(peripheral)
@@ -754,6 +780,7 @@ final class Explorer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         streamLeftover = leftover
         for r in records {
             recordCounts[r.type, default: 0] += 1
+            if r.ringTimestamp > latestSeenTs { latestSeenTs = r.ringTimestamp }
             let name = OuraProtocol.recordTypeName(r.type)
             // Type-specific human decode, validated against our own dump:
             //  0x43 = ASCII diagnostic log line; 0x42 = time anchor (unix ts LE).

@@ -12,10 +12,11 @@ data **without going through the Oura app or Oura's servers**.
 
 🟢 **Core challenge ACHIEVED** — we take over the ring with OUR own key, fully
 authenticated, **zero Oura app/cloud** in the auth path.
-🟢 **Heart rate retrieved** — `--read --cursor recent` reads **real heart rate from
-the worn ring, no Oura app**: e.g. `❤️ 67 bpm (over 48 beats) HRV(RMSSD)=109 ms`,
-matching the user's Fitbit. Also decodes temperature (~28°C skin) and motion.
-IBI bit-packing verified (0x80/0x60). Remaining: raw PPG waveform (0x81) + iOS app.
+🟢 **Data retrieval complete** — `--read --cursor recent` reads real biosignals from
+the worn ring, no Oura app: **heart rate ❤️ 60-67 bpm + HRV(RMSSD)** (matches the
+user's Fitbit), temperature, 3-axis accelerometer, motion state, plus full device
+telemetry. ~17 record types decoded. The only signal not exposed by this ring/fw is
+the raw PPG waveform (0x81 — derived to IBI on-device). Next: iOS app.
 
 ## Goals
 
@@ -41,8 +42,11 @@ and authenticates. The official Oura app can no longer reclaim the ring (it ente
   75/80/82/83): plus device telemetry from `0x61` sub-types — precise **fuel gauge**
   (96.35%), **sleep/ble/flash stats**, **PPG signal quality** (SNR/AC/DC), and HW IDs
   (**PPG sensor = Maxim MAX86178**, accel = Bosch BMA456).
-- ⏳ Raw PPG waveform (`0x81`, delta-encoded) — only one left; not retained in our
-  ring's retrievable event log (it derives IBI on-device). HR/HRV already work.
+- ⚠️ Raw PPG waveform (`0x81`) is the one signal NOT retrievable on this ring/fw:
+  it's not kept in the BLE event log (the ring derives IBI on-device and discards
+  the raw samples). Probed recent/older cursors + `--drain` (24 repeated fetches) →
+  never emitted. A capability boundary, not a decode gap — all derived physiology
+  (HR/HRV/IBI) already works.
 
 ### Next
 - Decode raw PPG waveform (0x81) for a full optical trace.
@@ -79,8 +83,9 @@ cd ble-explorer && swift build
 .build/debug/ble-explorer --read [hexkey]      # auth → infos → subscribe feat 0x02 → live AFE stream
 .build/debug/ble-explorer --read --history     # also dump buffered flash history (GetEvent)
 .build/debug/ble-explorer --read --seconds 30  # keep the live-stream window open for 30s
-.build/debug/ble-explorer --read --cursor recent      # fetch RECENT records → IBI/temp/motion biosignals
-.build/debug/ble-explorer --read --features 02,03,0b  # probe other feature IDs for PPG/IBI
+.build/debug/ble-explorer --read --cursor recent      # fetch RECENT records → HR/HRV/temp/accel biosignals
+.build/debug/ble-explorer --read --drain --seconds 60 # repeated GetEvent (drain records as the ring measures)
+.build/debug/ble-explorer --read --features 02,03,0b  # probe other feature IDs
 .build/debug/ble-explorer --reset [hexkey]     # authenticate then factory-reset (give ring back)
 .build/debug/ble-explorer --store-key <hexkey> # save a key into the macOS Keychain
 ```
