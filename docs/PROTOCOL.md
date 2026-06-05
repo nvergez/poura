@@ -113,22 +113,36 @@ Hybrid **streaming + batch catch-up**. ✅ **Verified on our ring** via `--read`
   `[type:1][len:1][ctr_lo][ctr_hi][ses_lo][ses_hi][payload(len-4)]`
   with `ringTimestamp = (session<<16)|counter` (two LE u16). `len` covers the 4
   timestamp bytes + payload; consume `2+len` per record.
-- **~40–50 record types** total. Confirmed in OUR data marked ✅:
+- **~40–50 record types** total. ✅ = decoded & verified on OUR ring's data:
 
-| Type | Content |
-|------|---------|
+| Type | Content (decoded values where ✅) |
+|------|------------------------------------|
 | `0x33` | accelerometer (sensor = Bosch **BMA456**, per `0x43` diag log) |
 | `0x41` | ✅ ring boot/start (`… 32 02 0b …` = fw at boot) |
-| `0x42` | ✅ time-sync anchor (`API_TIME_SYNC_IND`) — payload = unix ts LE |
-| `0x43` | ✅ **diag-log: ASCII text** (`git;…`, `SNH/SNL;…`, `HWID;ORE_06`, `chgv;…`) |
-| `0x45` | state change |
-| `0x61` | ✅ binary event/counter |
-| `0x80` | green-LED IBI quality |
-| `0x81` | raw PPG (delta-encoded, stateful across reconnections) |
-| `0x85` | RTC beacon |
+| `0x42` | ✅ time-sync anchor — payload = unix ts LE |
+| `0x43` | ✅ **diag-log ASCII** (`git;…`, `HWID;ORE_06`, `acm_bma456`, `chgv;…`) |
+| `0x45` | ✅ state-change: byte0 flag + ASCII name (`hr enable`, `motion det`…) |
+| `0x46` | ✅ **temperature** 3× i16 LE /100 °C (`[25.8, 28.0, 21.4]`) |
+| `0x47` | ✅ **3-axis accelerometer** int8×8 (`accel=(-816,-328,136)`) |
+| `0x50` | ✅ activity-info (byte0 class; bins opaque) |
+| `0x5b` | ✅ ble-conn telemetry (sub-dispatch; fields inferred) |
+| `0x5d` | ✅ **HRV** N×(HR bpm, RMSSD ms)/5-min |
+| `0x60` | ✅ **IBI+amplitude** (heart beats) |
+| `0x61` | ✅ **debug-data** sub-dispatch (battery/fuel/sleep/ble/flash/PPG-quality; AFE chip = Maxim **MAX86178**) |
+| `0x6b` | ✅ motion-period (NO_MOTION/RESTLESS/TOSSING/ACTIVE, low 2 bits) |
+| `0x6c` | ✅ feature-session (feature/capability/status) |
+| `0x72` | ✅ sleep-acm 6× u16 LE metrics |
+| `0x75` | ✅ sleep-temp N× i16 LE /100 °C trace |
+| `0x80` | ✅ **green-LED IBI quality** → HR/HRV (`ibi=(b_lo<<3)|(b_hi&7)` ms) |
+| `0x81` | ⏳ raw PPG (delta-encoded, stateful) — see note |
+| `0x82`/`0x83` | ✅ scan-start / scan-end |
+| `0x85` | RTC beacon (unix ts LE u32 + trailer) |
 
-> Not yet captured from our ring: raw biosignals (`0x80/0x81/0x33`). The pulled
-> history was system/charge events (ring just off the charger). See NEXT.md.
+> **0x81 raw PPG** is the only signal not retrieved from our ring: it is NOT in the
+> retrievable event log (the ring derives IBI on-device and discards the raw
+> waveform). The app capture caught 0x81 live during an active measurement burst
+> (session 5392). Everything that derives from PPG — HR, HRV, IBI — already works.
+> Heart rate cross-validated vs the user's Fitbit (60–67 bpm).
 
 - **Time**: ticks (~100 ms/tick default, 1 ms in burst), → UTC via `0x42`
   anchors. open_ring: `RingTimeResolver` (RE of `libappecore.so`).

@@ -47,12 +47,28 @@ ack and fetches from there.
 - 0x80: pairs → `ibi_ms = (b_low<<3)|(b_high&0x07)`, b_high≥0xE9 = sentinel.
 - 0x60: 6×(IBI, amp), bytes 0-5 IBI high + bytes 12-13 fine bits / amp shift.
 
-## Next task: raw PPG waveform (0x81) — optional, HR already works
+## Data retrieval ~COMPLETE. ~17 record types decoded & verified live.
 
-- `0x81` (delta-encoded PPG) didn't land in the short windows. Do a longer/again
-  `--read --cursor recent --seconds 30`, then write the stateful delta decoder
-  (0x80 marker → 3-byte abs u24; MSB-set byte = signed delta; else 7-bit signed
-  delta). open_ring §5.4 (CVA-PPG) is the reference.
+HR/HRV/temp/3-axis accel/HRV-windows/motion-state/named events + device telemetry
+(fuel gauge, sleep/ble/flash stats, PPG signal quality, HW IDs). See PROTOCOL.md
+table. HR cross-validated vs the user's Fitbit (60-67 bpm).
+
+## Only remaining: raw PPG waveform (0x81)
+
+- NOT in our ring's retrievable event log (probed recent + older cursors −0x10000…
+  −0x30000: IBI/temp/motion/debug present, no 0x81). The ring derives IBI on-device
+  and doesn't retain the raw waveform; the app capture caught 0x81 only as a LIVE
+  burst during active measurement (session 5392).
+- Last lead to try: stay connected with feature 0x02 subscribed and issue REPEATED
+  GetEvent at the current cursor (drain as PPG is generated) over a long still
+  window — vs the single start-of-session GetEvent we do now. If that yields nothing,
+  conclude this ring/firmware doesn't expose the raw waveform via BLE event fetch.
+- When 0x81 appears: stateful delta decode (0x80 marker → 3-byte abs u24; MSB-set
+  byte = signed delta; else 7-bit signed delta). open_ring §5.4 (CVA-PPG) is ref.
+
+## After that: iOS app
+Port to native iOS (Swift/CoreBluetooth) reusing `OuraProtocol.swift` (frame builders,
+AES proof, all the record decoders). Handle stale-bond clearing on re-takeover.
 - Optional older leads (the live-stream path, lower priority now):
   Feature 0x02 streams only a slow AFE channel (~1 Hz). Probed features
   0x02/03/04/0b/0d/10 — all ACK subscribe, only 0x02 emits. If you revisit:
